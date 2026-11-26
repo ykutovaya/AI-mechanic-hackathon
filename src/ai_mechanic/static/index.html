@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#173d36">
+  <title>Цифровой механик · Диагностика</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+  <script src="/static/orders.js" defer></script>
+</head>
+<body>
+  <header class="mast"><div class="mast-inner">
+    <div class="brand"><span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>Цифровой механик</div>
+  </div></header>
+  <main>
+    <h1>Диагностика двигателя</h1>
+    <div class="workspace">
+      <aside class="setup panel" aria-labelledby="setup-title">
+        <h2 id="setup-title">Машина и проверка</h2>
+        <div class="field"><label for="machine">Машина</label><select id="machine" disabled></select></div>
+        <div class="field"><label for="check">История проверок</label><select id="check" disabled></select></div>
+        <p class="engine-details">Исполнение · <span id="current-variant">Не указано</span></p>
+        <button id="diagnose" class="primary" type="button" disabled>Получить диагностику</button>
+        <button id="order-new" class="primary" type="button" hidden>Создать новую заявку</button>
+        <section id="order-history" aria-live="polite" hidden></section>
+        <button id="order-start" class="secondary" type="button" hidden>Подготовить заявку</button>
+        <p id="load-error" class="problem" role="alert" hidden></p>
+        <button type="button" class="retry" id="reload" hidden>Обновить список</button>
+      </aside>
+      <section class="chat panel" aria-labelledby="chat-title">
+        <header class="chat-heading"><h2 id="chat-title">Диалог</h2><span id="current-engine"></span></header>
+        <div id="log" class="log" role="log" aria-live="polite" aria-label="Сообщения">
+          <div class="empty" id="empty"><span class="book" aria-hidden="true"></span><h3>Вопрос по двигателю</h3><p>Запросите результат проверки или задайте вопрос по руководству выбранного двигателя.</p></div>
+        </div>
+        <div id="feedback" role="status" hidden></div>
+        <form id="composer"><label for="question">Вопрос по руководству</label>
+          <div class="input-row"><textarea id="question" rows="1" maxlength="3000" placeholder="Введите вопрос…" disabled></textarea>
+            <button id="send" type="submit" class="send" disabled><span>Отправить</span><span aria-hidden="true">↑</span></button></div>
+        </form>
+      </section>
+    </div>
+  </main>
+  <dialog id="source-dialog" aria-labelledby="source-title">
+    <div class="source-toolbar">
+      <button class="order-link" id="source-back" type="button">Вернуться в чат</button>
+      <a id="source-pdf" target="_blank" rel="noopener">Открыть полный PDF</a>
+    </div>
+    <h2 id="source-title">Источник</h2>
+    <img id="source-sheet" alt="">
+  </dialog>
+  <dialog id="order-dialog" aria-labelledby="order-heading">
+    <header class="order-heading"><h2 id="order-heading">Заявка на дефектовку</h2>
+      <button id="order-close" class="order-link" type="button">Закрыть</button></header>
+    <div class="order-body">
+      <dl id="order-meta" class="metrics"></dl>
+      <fieldset id="order-fields">
+        <label for="order-diagnosis">Предварительный диагноз</label>
+        <textarea rows="2" id="order-diagnosis" required></textarea>
+        <label id="order-lamp-row" class="order-check"><input id="order-lamp" type="checkbox">Лампа аварийного давления масла горела на средних оборотах — со слов механика.</label>
+        <label for="order-priority">Приоритет</label>
+        <select id="order-priority"><option value="low">Низкий</option><option value="medium">Средний</option><option value="high">Высокий</option></select>
+        <p id="order-reason"></p>
+        <label for="order-works">Работы · одна на строку</label><textarea id="order-works" rows="3" required></textarea>
+        <label for="order-parts">Запчасти · по одной на строку</label><textarea id="order-parts" rows="2" placeholder="Можно оставить пустым"></textarea>
+      </fieldset>
+      <div id="order-sources" class="refs"></div>
+      <p class="order-status" id="order-feedback" role="status"></p>
+    </div>
+    <footer class="order-actions" id="order-actions" hidden>
+      <button class="primary" id="order-send" type="button" disabled>Подтвердить и отправить</button>
+      <button class="primary" id="order-new-from-receipt" type="button" hidden>Создать новую заявку</button>
+    </footer>
+  </dialog>
+</body>
+</html>
