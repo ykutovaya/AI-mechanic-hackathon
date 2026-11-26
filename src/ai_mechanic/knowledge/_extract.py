@@ -90,6 +90,22 @@ def _recognize(page, language, rotation):
             "text": result.stdout.decode("utf-8").strip()}
 
 
+def _normalize_page_rotation(page):
+    """Учитывает поворот PDF, если он выравнивает основной текст страницы."""
+    if not page.rotation:
+        return
+    matrix = page.rotation_matrix
+    text_flags = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
+    direction_change = 0
+    for block in page.get_text("dict", flags=text_flags)["blocks"]:
+        for line in block.get("lines", []):
+            x, y = line["dir"]
+            count = sum(len(span["text"].strip()) for span in line["spans"])
+            direction_change += (x * matrix.a + y * matrix.c - x) * count
+    if direction_change > 0:
+        page.remove_rotation()
+
+
 def iter_pages(pdf_path, *, ocr_pages=(), ocr_language="rus", ocr_rotate=0, ocr_auto=False):
     """Возвращает все физические страницы с 1, включая страницы без текстового слоя."""
     with pymupdf.open(pdf_path) as doc:
@@ -101,6 +117,7 @@ def iter_pages(pdf_path, *, ocr_pages=(), ocr_language="rus", ocr_rotate=0, ocr_
         outline = {p: title.strip() for _, title, p in doc.get_toc() if 1 <= p <= len(doc)}
         section = ""
         for page in doc:
+            _normalize_page_rotation(page)
             number = page.number + 1
             text = page.get_text("text", sort=True).strip()
             heading = outline.get(number) or _local_heading(page)

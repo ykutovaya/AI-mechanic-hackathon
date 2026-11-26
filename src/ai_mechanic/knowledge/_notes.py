@@ -56,6 +56,13 @@ def apply_notes(rows, notes):
         try:
             if "source_sha256" in note and note["source_sha256"] != row["source_sha256"]:
                 raise ValueError("Разметка относится к другой версии PDF")
+            if "verified_text" in note:
+                if "source_sha256" not in note:
+                    raise ValueError("Для сверенного текста нужен SHA-256 PDF")
+                text = note["verified_text"]
+                if not isinstance(text, str) or not text.strip():
+                    raise ValueError("Укажите непустой сверенный текст")
+                row["text"] = text
             if "section" in note:
                 row["section"] = note["section"]
             if "fragments" in note:

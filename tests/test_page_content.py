@@ -136,6 +136,31 @@ class PageContentTests(unittest.TestCase):
             self.assertEqual(reviewed["ocr"]["text"], "Компрессор")
             self.assertEqual(reviewed["ocr"]["engine_models"], ["Б"])
 
+    def test_rotated_page_preserves_table_rows(self):
+        with TemporaryDirectory() as tmp:
+            pdf = Path(tmp) / "повёрнутая таблица.pdf"
+            with pymupdf.open() as source, pymupdf.open() as doc:
+                table = source.new_page(width=300, height=170)
+                for x in (20, 130, 280):
+                    table.draw_line((x, 40), (x, 100))
+                for y in (40, 70, 100):
+                    table.draw_line((20, y), (280, y))
+                table.insert_text((30, 60), "Cause")
+                table.insert_text((140, 60), "Action")
+                table.insert_text((30, 90), "Loose spring")
+                table.insert_text((140, 90), "Replace the oil pump")
+                rotated = doc.new_page(width=170, height=300)
+                rotated.show_pdf_page(rotated.rect, source, 0, rotate=90)
+                rotated.set_rotation(90)
+                doc.save(pdf)
+
+            first, = iter_pages(pdf)
+            self.assertEqual(first["page"], 1)
+            self.assertIn("Loose spring", first["text"])
+            self.assertEqual([table["rows"] for table in first.get("tables", [])], [
+                [["Cause", "Action"], ["Loose spring", "Replace the oil pump"]],
+            ])
+
     def test_cause_and_action_stay_in_one_table_row(self):
         with TemporaryDirectory() as tmp:
             pdf = Path(tmp) / "таблица.pdf"

@@ -57,7 +57,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m ai_mechanic.knowledge.pdf "data/raw/manuals/zmz-5234_rk_2025.pdf" --registry data/annotations/manuals.json --output data/processed/pages.jsonl --ocr-page auto
 ```
 
-Скрипт создаст `pages.jsonl` при первом успешном запуске. При повторной обработке заменятся записи выбранного PDF. Если разметка уже готова, передайте её путь через `--notes`. Текст OCR сохраняется отдельно со статусом `pending` до сверки.
+Скрипт создаст `pages.jsonl` при первом успешном запуске. При повторной обработке заменятся записи выбранного PDF. Если разметка уже готова, передайте её путь через `--notes`. Текст OCR сохраняется отдельно со статусом `pending` до сверки. В разметке `verified_text` задаёт сверенный текст страницы и требует `source_sha256` исходного PDF.
 
 Проверки извлечения PDF, сборки и поиска:
 

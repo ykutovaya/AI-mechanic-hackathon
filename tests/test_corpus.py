@@ -64,6 +64,35 @@ class CorpusTests(unittest.TestCase):
         self.assertEqual(first["fragments"][0]["condition"], "Только с датчиком")
         self.assertEqual(first["fragments"][0]["text"], "Таблица 1\nА   Б")
 
+    def test_verified_text_used_for_fragments_and_preserved_on_rerun(self):
+        texts = ("", "Размер 10-0,15 мм", "Продолжение")
+        self.extract(texts=texts)
+        _, original, _ = self.rows()
+        text = "Размер 10 мм с нижним отклонением −0,15 мм"
+        note = dict(document_id="А", page=2, source_sha256=original["source_sha256"],
+                    verified_text=text, related_pages=[3],
+                    fragments=[dict(start=text, engine_models=["М1", "М2"])])
+        self.notes.write_text(json.dumps([note]), encoding="utf-8")
+
+        self.extract(texts=texts, notes=self.notes)
+        self.extract(texts=texts)
+        _, corrected, continuation = self.rows()
+        self.assertEqual(corrected["text"], text)
+        self.assertEqual(corrected["fragments"][0]["text"], text)
+        self.assertEqual(corrected["related_pages"], [3])
+        self.assertEqual(continuation["related_pages"], [2])
+
+    def test_verified_text_requires_matching_source_hash(self):
+        self.extract()
+        before = self.output.read_bytes()
+        for fields in ({}, {"source_sha256": "другой PDF"}):
+            with self.subTest(fields=fields):
+                note = dict(document_id="А", page=2, verified_text="Исправленный текст", **fields)
+                self.notes.write_text(json.dumps([note]), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "SHA-256|верси"):
+                    self.extract(notes=self.notes)
+                self.assertEqual(self.output.read_bytes(), before)
+
     def test_wrong_registry_page_count_leaves_previous_corpus_intact(self):
         self.assertEqual(self.extract(), 3)
         before = self.output.read_bytes()
