@@ -9,10 +9,10 @@
 | Путь | Содержимое |
 | --- | --- |
 | `data/raw/requirements/` | Оригиналы DOCX. Описание кейса v2, ТЗ НейроДВС v6 и описание бизнес-процессов v6. |
-| `documents/requirements/` | Markdown-копии этих документов с исходными названиями. Основной источник требований и приёмки — [ТЗ v6](documents/requirements/ТЗ_хакатон_ИИкузница_НейроДВС_v6_2026-11-16.md). |
+| `documents/requirements/` | Markdown-копии этих документов с исходными названиями. Для сверки требований и приёмки используйте локальный файл `documents/requirements/ТЗ_хакатон_ИИкузница_НейроДВС_v6_2026-11-16.md`. |
 | `data/raw/manuals/` | Шесть выданных PDF с исходными именами. |
 | `data/raw/vehicles.json`, `data/raw/fault_types.json` | Список машин с историей проверок и справочник неисправностей. Если они лежат в архиве заглушек, скопируйте их из `vendor/organizers/data/`. |
-| `vendor/organizers/` | Архив заглушек ML и ТОиР в распакованном виде. Сохраните его структуру, включая OpenAPI и каталог `data/`. Запуск описан в [README организаторов](vendor/organizers/README.md). |
+| `vendor/organizers/` | Архив заглушек ML и ТОиР в распакованном виде. Сохраните его структуру, включая OpenAPI и каталог `data/`. После распаковки откройте `vendor/organizers/README.md` с командами запуска. |
 
 Комплект и Markdown-копии требований хранятся локально. Git исключает `data/`, `vendor/` и `documents/requirements/`.
 
@@ -33,3 +33,34 @@ bash scripts/prepare-vm.sh && bash scripts/prepare-vm.sh --check
 ```
 
 При успешной проверке скрипт выводит «Проверка пройдена.»
+
+## Извлечение текста из руководства
+
+При первой настройке из корня репозитория создайте окружение и установите зависимости. Понадобится Python 3.11 или новее.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+```
+
+Создайте реестр выданных руководств:
+
+```powershell
+.\.venv\Scripts\python.exe scripts/create_manual_registry.py
+```
+
+Скрипт сверяет число страниц с ТЗ v6 и записывает обозначения, редакции, модели двигателей и SHA-256 в `data/annotations/manuals.json`.
+
+Для `--ocr-page auto` установите Tesseract и проверьте наличие `rus` в выводе `tesseract --list-langs`. Обработайте одно руководство:
+
+```powershell
+.\.venv\Scripts\python.exe -m ai_mechanic.knowledge.pdf "data/raw/manuals/zmz-5234_rk_2025.pdf" --registry data/annotations/manuals.json --output data/processed/pages.jsonl --ocr-page auto
+```
+
+Скрипт создаст `pages.jsonl` при первом успешном запуске. При повторной обработке заменятся записи выбранного PDF. Если разметка уже готова, передайте её путь через `--notes`. Текст OCR сохраняется отдельно со статусом `pending` до сверки.
+
+Проверки на небольших тестовых PDF:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
