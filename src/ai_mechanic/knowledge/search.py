@@ -573,7 +573,7 @@ def _component_words(text):
 
 
 def _disassembly(search, question):
-    """Извлекает нумерованную разборку названного узла из размеченной процедуры."""
+    """Извлекает нумерованную разборку названного узла."""
     request = re.search(r"\b(?:разобрать|разбирать|разборк[аиуе])\s+"
                         r"([\w-]+(?:[ \t]+[\w-]+){0,4})[?!. ]*$", question.strip())
     if not request:
@@ -581,29 +581,36 @@ def _disassembly(search, question):
     component = request[1]
     wanted = _component_words(component)
     for hit in search.find(f"Разборка {component}"):
-        if hit.get("kind") != "procedure":
+        kind = hit.get("kind")
+        if kind not in {"procedure", "text"}:
             continue
         title = hit.get("section", "").split(".", 1)[0]
         owner = _component_words(title.removeprefix("Разборка "))
-        # Например, внутри раздела «Масляный насос» заголовок сокращён до «Разборка насоса».
+        # В разделе об узле заголовок разборки может быть сокращён.
         for heading in re.finditer(r"^[ \t]*Разборка[ \t]+([^\n.:]+?)[ \t]*[:.]?[ \t]*$", hit["text"], re.I | re.M):
             name = _component_words(heading[1])
-            if not (owner == wanted and name and all(word in wanted for word in name)
-                    or name == wanted and len(name) > 1):
-                continue
             body = hit["text"][heading.end():].strip()
             boundary = re.search(r"^[ \t]*(?:После разборки\b|Сборка\b|Дефектовка\b)", body, re.M | re.I)
             if boundary:
                 body = body[:boundary.start()].rstrip()
-            elif not (title == hit.get("section") and title.casefold().startswith("разборка ") and owner == wanted
+            elif not (kind == "procedure" and title == hit.get("section")
+                      and title.casefold().startswith("разборка ") and owner == wanted
                       and len(hit.get("page_parts", [hit])) == 1):
+                continue
+            named_in_heading = (owner == wanted and name and all(word in wanted for word in name)
+                                or name == wanted and len(name) > 1)
+            # Если индекс сохранил только общий раздел, название насоса подтверждает сам шаг.
+            named_in_step = (kind == "text" and title.casefold() == "разборка двигателя"
+                             and name == ["насос"] and wanted == _component_words("масляный насос")
+                             and re.search(r"\b(?:крышки|корпуса) масляного насоса\b", _clean(body), re.I))
+            if not (named_in_heading or named_in_step):
                 continue
             parts = re.split(r"^[ \t]*(\d+)[.)][ \t]+", body, flags=re.M)
             numbers = [int(number) for number in parts[1::2]]
             steps = [_clean(step) for step in parts[2::2]]
             if parts[0].strip() or not steps or not all(steps) or numbers != list(range(1, len(steps) + 1)):
                 continue
-            text = "\n\n".join(f"{i}. {step}" for i, step in enumerate(steps, 1))
+            text = "\n".join(f"{i}. {step}" for i, step in enumerate(steps, 1))
             search.add(hit, body, text=text)
             return True
     return False

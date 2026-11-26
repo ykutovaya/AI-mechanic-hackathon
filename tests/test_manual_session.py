@@ -140,3 +140,53 @@ class ManualSessionTest(unittest.TestCase):
         self.assertEqual([source["page"] for source in answer["sources"]], [1, 2])
         self.assertTrue(any(step["role"] == "work" and step["page"] == 2
                             for step in answer["inspection_steps"]))
+
+    def test_disassembly_keeps_five_steps_under_one_citation(self):
+        hit = dict(self.evidence[1], kind="text", section="Разборка двигателя", text=(
+            "Разборка насоса\n"
+            "1. Отвернуть две гайки крепления и снять насос. Вылить масло из насоса,\n"
+            "перевернув его крышкой вверх.\n"
+            "2. Закрепить корпус насоса и отвернуть пробку перепускного клапана, вы-\n"
+            "нуть пружину и плунжер.\n"
+            "3. Отвернуть четыре болта крепления крышки масляного насоса, снять\n"
+            "крышку и перегородку с прокладками.\n"
+            "4. Вынуть валик насоса с ведущей шестерней в сборе из корпуса.\n"
+            "5. Вынуть ведомую шестерню насоса из корпуса.\n"
+            "После разборки насоса все его детали должны быть промыты."
+        ))
+
+        class Search:
+            def search(self, engine, query, *, variant, limit):
+                return [hit]
+
+        session = ManualSession(root=self.root, search=Search())
+        for question in ("Как разобрать масляный насос?", "Порядок разборки масляного насоса?"):
+            with self.subTest(question=question):
+                answer = session.ask("V1", question, check_id="S1")
+                self.assertEqual([source["page"] for source in answer["sources"]], [2])
+                self.assertEqual(len(answer["text"].split("\n\n")), 1)
+                steps = answer["text"].removeprefix("По руководству. ").splitlines()
+                self.assertEqual([step[0] for step in steps], list("12345"))
+                self.assertIn("вынуть пружину и плунжер", steps[1])
+                self.assertIn("крышки масляного насоса", steps[2])
+                self.assertTrue(steps[-1].endswith("[1]"))
+                self.assertNotIn("После разборки", answer["text"])
+
+    def test_disassembly_does_not_infer_a_node_or_a_missing_step(self):
+        from ai_mechanic.knowledge.search import retrieve
+
+        hit = dict(self.evidence[1], kind="text", section="Разборка двигателя")
+
+        class Search:
+            def search(self, engine, query, *, variant, limit):
+                return [hit]
+
+        for case in (
+            "Разборка насоса\n1. Снять крышку топливного насоса.\nПосле разборки промыть детали.",
+            "Разборка насоса\n1. Снять крышку масляного насоса.\n3. Вынуть вал.\nПосле разборки промыть детали.",
+            "Разборка насоса\n1. Снять крышку масляного насоса.\n2. Вынуть вал.",
+        ):
+            with self.subTest(case=case):
+                hit["text"] = case
+                result = retrieve(Search(), "ДВС-1", "Как разобрать масляный насос?")
+                self.assertNotEqual(result["topic"], "disassembly")

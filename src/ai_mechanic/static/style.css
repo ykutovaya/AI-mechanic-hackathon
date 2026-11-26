@@ -46,7 +46,7 @@ select { width: 100%; min-width: 0; height: 45px; padding: 0 9px; color: var(--i
 .message { flex: 0 0 auto; overflow-wrap: anywhere; max-width: 100%; padding: 16px 18px; background: white; border: 1px solid var(--line); border-radius: 3px 12px 12px; }
 .message.user { align-self: end; background: #e8f0e1; border-color: #d6e2cd; border-radius: 12px 3px 12px 12px; }
 .message h3 { font-size: 14px; color: var(--forest); margin-bottom: 6px; }
-.message p { margin: 7px 0; font-size: 15px; } .message p:last-child { margin-bottom: 0; }
+.message p { margin: 7px 0; font-size: 15px; white-space: pre-line; } .message p:last-child { margin-bottom: 0; }
 .ml { margin: 9px 0 14px; border-left: 3px solid #71964c; padding: 5px 0 7px 12px; }
 .ml[data-status="anomaly"], .ml[data-status="deviation"] { border-color: #bd782d; } .ml[data-status="bad"] { border-color: #ae4b3f; }
 .ml h4 { margin: 0; font-size: 16px; }
