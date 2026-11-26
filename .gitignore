@@ -1,0 +1,8 @@
+data/
+documents/tmp
+documents/requirements
+vendor/
+
+.venv/
+__pycache__/
+*.egg-info/
