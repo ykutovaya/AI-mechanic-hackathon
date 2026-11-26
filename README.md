@@ -59,8 +59,31 @@ python -m venv .venv
 
 Скрипт создаст `pages.jsonl` при первом успешном запуске. При повторной обработке заменятся записи выбранного PDF. Если разметка уже готова, передайте её путь через `--notes`. Текст OCR сохраняется отдельно со статусом `pending` до сверки.
 
-Проверки на небольших тестовых PDF:
+Проверки извлечения PDF, сборки и поиска:
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
+
+## Пробная сборка индекса Qdrant
+
+После обновления зависимостей командой `pip install -e .` запустите Docker Desktop. При первом запуске создайте контейнер с отдельным томом:
+
+```powershell
+docker run -d --name mechanic-hackathon-qdrant --publish 127.0.0.1:6335:6333 --mount type=volume,source=mechanic-hackathon-qdrant,target=/qdrant/storage qdrant/qdrant:v1.19.2
+```
+
+При повторном запуске контейнера используйте `docker start mechanic-hackathon-qdrant`.
+
+Подготовьте `manuals.json`, `pages.jsonl` и `page_notes.json`. Если файлы моделей лежат в другом месте, задайте `AI_MECHANIC_E5_DIR` для E5 Small и `FASTEMBED_CACHE_PATH` для кэша BM25. По умолчанию используются `~/.cache/ai-mechanic/e5-small` и `~/.cache/fastembed`. На ВМ их готовит [prepare-vm.sh](scripts/prepare-vm.sh). В каталоге E5 Small нужны `tokenizer.json`, `onnx/model.onnx` и файл `REVISION` со значением `614241f622f53c4eeff9890bdc4f31cfecc418b3`.
+
+Соберите пробный индекс и проверьте физическую страницу в выдаче:
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m ai_mechanic.knowledge.qdrant_index build --url http://127.0.0.1:6335 --collection mechanic_hackathon_smoke --document zmz-5234-10-rk-2025 --page 9 --page 23 --page 102 --page 103
+.\.venv\Scripts\python.exe -X utf8 -m ai_mechanic.knowledge.qdrant_index search --url http://127.0.0.1:6335 --collection mechanic_hackathon_smoke --engine 'ЗМЗ-5234.10' --query 'Какое моторное масло использовать в двигателе?'
+```
+
+Для поиска по карточке машины используйте `--vehicle-id` вместо `--engine`. Команда возьмёт `engine_model` из `data/raw/vehicles.json`. Передавайте `--variant` при подтверждённом исполнении. При неизвестном исполнении поиск вернёт общие фрагменты этой модели.
+
+Пути входных файлов можно переопределить через `--registry`, `--pages` и `--notes`. Ограниченную сборку запускайте с отдельным псевдонимом. Псевдоним `mechanic_hackathon` используйте для полной сборки после приёмки.
