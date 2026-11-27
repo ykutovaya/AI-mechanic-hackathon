@@ -209,6 +209,41 @@ class QdrantSearch:
         hit["tables"] = part.get("tables", legacy_tables)
         return hit
 
+    def page_hits(self, engine, document, page, *, variant=None, code=None):
+        """Читает из индекса части одной физической страницы с подходящей применимостью."""
+        pairs = {f"{engine}|all"}
+        if variant:
+            pairs.add(f"{engine}|{variant}")
+        allowed = models.Filter(must=[
+            models.FieldCondition(key="applicability", match=models.MatchAny(any=sorted(pairs))),
+            models.FieldCondition(key="document_id", match=models.MatchValue(value=document)),
+            models.FieldCondition(key="source_pages", match=models.MatchValue(value=page)),
+        ])
+        encoder = self._encoder if self._encoder is not None else embeddings(self.cache_dir)
+        physical = self._physical_collection(encoder.signature)
+        hits = []
+        offset = None
+        while True:
+            points, offset = self.client.scroll(physical, scroll_filter=allowed, offset=offset, limit=64,
+                                                with_payload=True, with_vectors=False)
+            for point in points:
+                chunk = point.payload
+                if engine in chunk.get("engine_models", ()):
+                    hits.extend(self._fault_page_hit(chunk, part, code, pairs) for part in chunk["page_parts"]
+                                if part["page"] == page)
+            if offset is None:
+                return hits
+
+    @classmethod
+    def _fault_page_hit(cls, chunk, part, code, pairs):
+        hit = cls._page_hit(chunk, part)
+        rows = sorted({row for field in ("fault_bindings", "fault_routes") for ref in chunk.get(field, ())
+                       if ref["code"] == code and ref["applicability"] in pairs and part["page"] in ref["source_pages"]
+                       for row in ref["rows"]})
+        if rows:
+            hit.update(fault_code=code, expert_rows=rows)
+        return hit
+
     def search_fault(self, engine, query, *, code, variant=None, limit=16):
         """Ищет по коду ML внутри разрешённых страниц и исполнений одного двигателя."""
         if not engine or not query.strip() or code not in {f"F{i:02}" for i in range(1, 15)} or not 1 <= limit <= 100:
@@ -228,13 +263,9 @@ class QdrantSearch:
         physical = self._physical_collection(encoder.signature)
         hits = []
         for chunk in self._ranked_chunks(physical, encoder, query, allowed, limit):
-            references = [ref for field in fields for ref in chunk.get(field, ())
-                          if ref["code"] == code and ref["applicability"] in pairs]
             for part in chunk["page_parts"]:
-                rows = sorted({row for ref in references if part["page"] in ref["source_pages"] for row in ref["rows"]})
-                if rows:
-                    hit = self._page_hit(chunk, part)
-                    hit.update(fault_code=code, expert_rows=rows)
+                hit = self._fault_page_hit(chunk, part, code, pairs)
+                if hit.get("expert_rows"):
                     hits.append(hit)
         return hits
 

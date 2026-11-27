@@ -11,6 +11,7 @@ _PARAGRAPH = re.compile(r"абзац\s+[«\"]([^»\"]+)[»\"]", re.I)
 _CELL = re.compile(r"строка\s+[«\"]([^»\"]+)[»\"]\s*\|\s*"
                    r"(?:графа|столбец)\s+[«\"]([^»\"]+)[»\"]", re.I)
 _POINT = r"(?:п(?:ункт)?\.?|шаг)\s*(\d{1,3}(?:\.\d{1,3})*)"
+_POINT_ON_PAGE = re.compile(rf"{_POINT}\s+на\s+стр\.\s*(\d+)", re.I)
 _NUMBER = r"[+−-]?\d+(?:[.,]\d+)?"
 _UNIT = (r"об\s*/\s*мин|мин\s*[-⁻]1|(?:кгс|Н)\s*[·⋅∙*×]?\s*м|кгс\s*/\s*см[2²]|"
          r"(?:М|к)?Па|(?:м|М|к)?В|(?:м|к)?Вт|(?:°[СC]|°)|мм|см|мкм|кг|%|сек|мин|ч|Ом")
@@ -41,6 +42,18 @@ def _heading(value):
     return clean(value or "").casefold().replace("ё", "е")
 
 
+def point_on_page(spec):
+    """Читает запись «п. 11.6 на стр. 216» из колонки страниц."""
+    match = _POINT_ON_PAGE.fullmatch(spec)
+    return (int(match[2]), f"пункт {match[1]}", "") if match else None
+
+
+def point_number(reference):
+    """Возвращает номер пункта для проверяемого локатора."""
+    match = re.fullmatch(_POINT, reference[1], re.I) if reference else None
+    return match[1] if match else None
+
+
 def locator(section, place):
     """Читает явный локатор или номер пункта, уже записанный в разделе Excel."""
     if place:
@@ -68,6 +81,8 @@ def verified_locations(chunks, pages, reference):
     cell = _CELL.fullmatch(coordinate)
     if not (step or paragraph or cell):
         raise ValueError("Место должно указывать пункт, начало абзаца или строку и графу таблицы")
+    numbered_text = []
+    numbered_table_pages = set()
     for chunk in chunks:
         if title and _heading(title) != _heading(chunk["section"]):
             continue
@@ -89,7 +104,15 @@ def verified_locations(chunks, pages, reference):
                     context = "\n".join(_table_line(v) for v in (header, row))
                     yield chunk, dict(page=part["page"], text=context), " ".join(
                         (compare, header[column] or "", row[0] or ""))
-            elif step and not part.get("tables"):
+            elif step and part.get("tables"):
+                for header, row in _table_rows(part):
+                    number = _STEP.match(clean(row[0]))
+                    if number and number[1] == step[1]:
+                        numbered_table_pages.add(part["page"])
+                        passage = "\n".join(_table_line(values) for values in (header, row))
+                        source = dict(page=part["page"], text=passage, tables=[{"rows": [header, row]}])
+                        yield chunk, source, _table_line(row)
+            elif step:
                 lines = list(_STEP.finditer(part["text"]))
                 for i, item in enumerate(lines):
                     if item[1] != step[1]:
@@ -98,7 +121,8 @@ def verified_locations(chunks, pages, reference):
                                 if not other[1].startswith(item[1] + ".")), len(part["text"]))
                     passage = part["text"][item.end():end].strip()
                     if passage:
-                        yield chunk, dict(page=part["page"], text=passage), passage
+                        source = dict(page=part["page"], text=part["text"][item.start():end].strip())
+                        numbered_text.append((chunk, source, passage))
             elif paragraph and not part.get("tables"):
                 start = _heading(paragraph[1])
                 if len(start.split()) < 3:
@@ -108,6 +132,11 @@ def verified_locations(chunks, pages, reference):
                     beginning = _heading(passage)
                     if beginning == start or beginning.startswith((start + " ", start + ",")):
                         yield chunk, dict(page=part["page"], text=passage), passage
+
+    # На одном листе текстовый слой может дублировать таблицу с перемешанными колонками.
+    for chunk, part, passage in numbered_text:
+        if part["page"] not in numbered_table_pages:
+            yield chunk, part, passage
 
 
 def _table_line(cells):

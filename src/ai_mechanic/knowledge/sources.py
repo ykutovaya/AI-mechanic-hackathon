@@ -49,3 +49,20 @@ def resolve_source(hit, registry, root):
         raise SourceUnavailable(f"{name}: недоступен источник {path.name} ({exc}).") from exc
     return {"document_id": doc_id, "title": row["title"], "edition": row["edition"],
             "page": page, "url": f"{path.as_uri()}#page={page}"}
+
+
+def verified_pdf_pages(registry, root, document_id, engine, pages, *, sort=True):
+    """Читает физические страницы оригинала после проверки модели, редакции и SHA-256."""
+    rows = [row for row in registry if row["document_id"] == document_id and engine in row["engine_models"]]
+    if len(rows) != 1 or not pages:
+        return {}
+    row = rows[0]
+    try:
+        resolve_source(dict(row, page=pages[0]), registry, root)
+        with pymupdf.open(Path(root) / row["path"]) as pdf:
+            if any(type(page) is not int or not 1 <= page <= pdf.page_count for page in pages):
+                return {}
+            return {page: dict(row, engine_models=[engine], page=page, text=pdf[page - 1].get_text(sort=sort))
+                    for page in pages}
+    except (OSError, RuntimeError, ValueError):
+        return {}

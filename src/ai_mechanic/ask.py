@@ -2,15 +2,27 @@
 
 import argparse
 import json
+import re
 import webbrowser
 
 from qdrant_client.http.exceptions import ApiException
 from pathlib import Path
 import sys
 
+from .knowledge.valve_belt_checks import VALVE_TOPIC, complete_valve_sources
+from .knowledge.clutch_yamz236 import CLUTCH_TOPIC, complete_clutch_sources
+from .knowledge.diagnostic_clarifications import GEAR_TOPIC, add_gear_drive_source
+from .knowledge.diagnostic_works import complete_chain_sources
+from .knowledge.f11_egr import add_catalog_egr_evidence
+from .knowledge.temperature_pressure_checks import add_oil_indicator_evidence
+from .knowledge.zmz40904_oil import ZMZ40904_OIL_TOPIC, complete_zmz40904_oil_sources
+from .knowledge.air_filter import AIR_FILTER_TOPIC, air_filter_reference
+from .knowledge.fuel_system import fuel_system_reference
+from .knowledge.ignition import ignition_observations
 from .knowledge.search import SearchUnavailable, add_search_arguments, configured_search, retrieve
 from .knowledge.sources import SourceUnavailable, resolve_source
 from .knowledge.expert_catalog import requests_references
+from .knowledge.expert_answers import generic_diagnostic_question
 
 
 def _records(path, key=None):
@@ -46,6 +58,8 @@ def _validated_result(result, machine, check_id):
         raise ValueError("Неизвестный статус проверки ML.")
     if result.get("signal_quality") not in {"good", "warning", "bad"}:
         raise ValueError("Неизвестное качество записи ML.")
+    if result.get("anomaly_type") == "F12":
+        result = dict(result, description=ignition_observations(result.get("description") or ""))
     return result
 
 
@@ -58,6 +72,76 @@ def _applies(hit, engine, variant):
     return bool(allowed.intersection(hit.get("applicability", ())))
 
 
+# Заводская конструкция сверена именно в этих редакциях PDF.
+_FACTORY_LAYOUTS = {
+    ("F09", "ЗМЗ-40905.10"): (
+        ("zmz-40904-40905-rk-2025", "99cf64334c578d668ce67bc4c9a1d7b0bb1e9c59ddac982b6061ea18533a7147", (64, 65)),
+    ),
+    ("F09", "ЗМЗ-5234.10"): (
+        ("zmz-5234-10-rk-2025", "1abd24d9c7f81167a895bec4372bc439e85995aa6207349d8b6e8edb4eac9c09", (30, 84)),
+    ),
+    ("F11", "ЯМЗ-236М2"): (
+        ("yamz-236m2-re-2010", "4268a9519e02a668a826fe6d154de0360f6767015868ca2de7410ba570d73dd1", (43,)),
+        ("yamz-236m2-rk-2014", "231e067ea9d220dec0ab7629bf19fbbf59d29e01d81e9f3bf5b0b1dee76a141b", (180, 221)),
+    ),
+}
+_FACTORY_SYSTEM_NOTICES = {
+    "F09": ("Турбокомпрессор, наддув", "турбокомпрессор не предусмотрен"),
+    "F11": ("Рециркуляция отработавших газов", "система рециркуляции отработавших газов (EGR) не предусмотрена"),
+}
+
+
+def _factory_layout_sources(registry, root, engine, documents):
+    """Возвращает ссылки после проверки всех редакций и физических страниц."""
+    sources = []
+    for document, digest, pages in documents:
+        entries = [entry for entry in registry if entry["document_id"] == document
+                   and entry.get("source_sha256") == digest and engine in entry["engine_models"]]
+        if len(entries) != 1:
+            return []
+        try:
+            sources.extend(resolve_source(dict(entries[0], page=page), registry, root) for page in pages)
+        except SourceUnavailable:
+            return []
+    return sources
+
+
+def _diagnosis_applicability_message(question, machine, diagnosis):
+    """Объясняет, когда выбранная машина требует сверки результата ML."""
+    code = diagnosis.get("anomaly_type")
+    engine = machine.get("engine_model")
+    known_fuel = {"ЯМЗ-536": "дизель", "ЗМЗ-5234.10": "бензин"}
+    fuel = known_fuel.get(engine) or (machine.get("fuel") or "").strip().casefold()
+    # Экспертная таблица: строки 512, 525 и 536 для выданных руководств ЗМЗ.
+    if code == "F09" and (code, engine) in _FACTORY_LAYOUTS:
+        notice = ("ML выдал код F09. По руководству не удалось подтвердить, "
+                  "что этот код применим к выбранному двигателю.")
+        subject = r"наддув\w*|турбокомпрессор\w*|ткр"
+    elif code == "F11" and engine == "ЯМЗ-236М2":
+        notice = ("ML выдал код F11. В проверенных руководствах для ЯМЗ-236М2 применимость "
+                  "проверки системы рециркуляции отработавших газов не подтверждена.")
+        subject = r"рециркуляци\w*|egr|срог|рог"
+    elif code == "F13" and fuel == "дизель":
+        notice = "ML выдал код F13 — подача бензина. В карточке машины указан дизельный двигатель."
+        subject = r"бензин\w*"
+    elif code == "F08" and fuel == "бензин":
+        notice = "ML выдал код F08 — дизельная топливоподача. В карточке машины указан бензиновый двигатель."
+        subject = r"дизел\w*|топливоподач\w*|тнвд"
+    elif code == "F12" and fuel == "дизель":
+        notice = "ML выдал код F12 — зажигание. В карточке машины указан дизельный двигатель."
+        subject = r"зажигани\w*|искр\w*|катушк\w*"
+    else:
+        return ""
+
+    title = (diagnosis.get("anomaly_title") or "").casefold()
+    focus = question.casefold().replace(title, "").strip(" .?!")
+    focus = re.sub(r"\bв первую очередь\b", "", focus).strip()
+    if not focus or generic_diagnostic_question(focus) or re.search(rf"\b(?:{code}|{subject})\b", question, re.I):
+        return (f"{notice} Сверьте модель двигателя и убедитесь, "
+                "что запись сделана на этой машине. Затем повторите проверку")
+    return ""
+
+
 def _ml_observation(diagnosis):
     description = diagnosis.get("description") or ""
     if diagnosis["status"] == "normal":
@@ -66,7 +150,11 @@ def _ml_observation(diagnosis):
         title = diagnosis.get("anomaly_title") or "Предполагаемая неисправность"
         code = diagnosis.get("anomaly_type") or ""
         label = f"{code} — {title}" if code else title
-        lines = [f"Гипотеза ML. {label}.", f"Признаки по ML. {description}".strip()]
+        lines = [f"Гипотеза ML. {label}."]
+        if description:
+            lines.append(f"Признаки по ML. {description}")
+        else:
+            lines.append("В описании ML не удалось выделить признаки неисправности.")
     if diagnosis["signal_quality"] == "warning":
         lines.append("В записи есть помехи. Сверьте признаки при осмотре или повторите запись.")
     confidence = diagnosis.get("confidence")
@@ -170,6 +258,18 @@ class ManualSession:
         lines = []
         if diagnosis is not None:
             diagnosis = _validated_result(diagnosis, machine, check_id)
+        if reference := fuel_system_reference(self.registry, self.root, engine, question):
+            self.topic = "fuel-system-reference"
+            reply["text"], reply["sources"] = reference
+            reply["synthesis"] = "extractive"
+            return reply
+        if reference := air_filter_reference(self.registry, self.root, engine, question, topic=self.topic):
+            self.topic = AIR_FILTER_TOPIC
+            reply["text"], reply["sources"], reply["needs_clarification"] = reference
+            if reply["sources"]:
+                reply["synthesis"] = "extractive"
+            return reply
+        if diagnosis is not None:
             if diagnosis["status"] == "check_failed" or diagnosis["signal_quality"] == "bad":
                 self.topic = ""
                 failure = "Сбой проверки." if diagnosis["status"] == "check_failed" else "Запись непригодна для диагностики."
@@ -192,10 +292,43 @@ class ManualSession:
                 return reply
             backend = self.search if self.search is not None else configured_search()
             return self._reading_references(reply, backend, engine, variant, diagnosis["anomaly_type"])
+        if anomaly and (message := _diagnosis_applicability_message(question, machine, diagnosis)):
+            self.topic = ""
+            reply["text"] = message
+            code = diagnosis["anomaly_type"]
+            if documents := _FACTORY_LAYOUTS.get((code, engine)):
+                sources = _factory_layout_sources(self.registry, self.root, engine, documents)
+                if sources:
+                    name, finding = _FACTORY_SYSTEM_NOTICES[code]
+                    manuals = "руководстве" if len(documents) == 1 else "руководствах"
+                    refs = " ".join(f"[{index}]" for index in range(1, len(sources) + 1))
+                    reply["sources"] = sources
+                    reply["text"] = (
+                        f"ML выдал код {code} «{name}».\n\n"
+                        f"В штатной конструкции двигателя {engine}, описанной в {manuals}, {finding}. {refs}\n\n"
+                        "Сверьте модель двигателя, убедитесь, что запись сделана на этой машине, и повторите проверку."
+                    )
+            return reply
         backend = self.search if self.search is not None else configured_search()
         result = self.retrieve(backend, engine, question, diagnosis=diagnosis, topic=self.topic,
                                variant=variant, procedures=self.procedures)
         self.topic = result.get("topic") or ""
+        if result.get("manual_reference") and (result["evidence"] or result["needs_clarification"]):
+            lines.clear()
+        if self.topic == "egr-inspection" and not result["evidence"] and engine == "ЗМЗ-5234.10":
+            add_catalog_egr_evidence(result, backend, engine, variant, self.registry, self.root)
+        if self.topic in {"chain-phases", "chain-marks"}:
+            complete_chain_sources(result, self.registry, self.root, engine)
+        if self.topic.partition(":")[0] == CLUTCH_TOPIC:
+            complete_clutch_sources(result, self.registry, self.root, engine)
+        if self.topic == GEAR_TOPIC:
+            add_gear_drive_source(result, self.registry, self.root, engine)
+        if self.topic == VALVE_TOPIC and not re.search(r"руководств\w* по ремонту|\bпо РК\b", question, re.I):
+            complete_valve_sources(result, self.registry, self.root, engine)
+        if self.topic == "oil-indicator-test" and not result["evidence"]:
+            add_oil_indicator_evidence(result, self.registry, self.root, engine)
+        if self.topic.partition(":")[0] == ZMZ40904_OIL_TOPIC:
+            complete_zmz40904_oil_sources(result, self.registry, self.root, engine, question)
         reply["queries"] = result["queries"]
         labels = {"fact": "По руководству", "general": "Общая проверка",
                   "cause": "Возможные причины по руководству", "risk": "Оценка риска"}
@@ -215,6 +348,8 @@ class ManualSession:
             if key not in numbers:
                 reply["sources"].append(source)
                 numbers[key] = len(reply["sources"])
+            if item.get("source_origin"):
+                reply["sources"][numbers[key] - 1]["source_origin"] = item["source_origin"]
             if item.get("expert_rows"):
                 reference = reply["sources"][numbers[key] - 1]
                 reference["fault_code"] = item["fault_code"]
@@ -246,7 +381,8 @@ class ManualSession:
                 fragment in question.casefold() for fragment in ("комплектац", "исполнен")):
             lines.append("Уточните исполнение двигателя по табличке, чтобы подобрать процедуру.")
             reply["needs_clarification"] = True
-        if anomaly and (result.get("asks_about_fault") or result.get("inspection_missing")):
+        if (anomaly and not needs_clarification and not self.topic.startswith("clutch-noise")
+                and (result.get("asks_about_fault") or result.get("inspection_missing"))):
             if not any(step["role"] == "work" for step in reply["inspection_steps"]):
                 lines.append("Рекомендована дефектовка. Для заявки нужна применимая работа со ссылкой на руководство.")
         reply["text"] = "\n\n".join(lines)

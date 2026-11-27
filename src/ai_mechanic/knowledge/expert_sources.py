@@ -9,7 +9,9 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-from .expert_locations import candidates, check_paraphrase, labelled_row_locations, locator, verified_locations
+from .expert_locations import (
+    candidates, check_paraphrase, labelled_row_locations, locator, point_number, point_on_page, verified_locations,
+)
 from .qdrant_chunks import _chunk, _model_restriction
 
 
@@ -332,7 +334,9 @@ def _bind(row, detail, registry, codes, cards, raw_pages, by_page, output):
     detail["document_id"] = doc_id
     if engine not in doc["engine_models"]:
         raise ValueError("Двигатель отсутствует в реестре этого руководства")
-    numbers = _page_numbers(row["Страницы PDF"], doc["page_count"])
+    numbered_page = point_on_page(detail["pages_spec"])
+    page_spec = numbered_page[0] if numbered_page else detail["pages_spec"]
+    numbers = _page_numbers(page_spec, doc["page_count"])
     detail["requested_pages"] = numbers
     pages = [raw_pages.get((doc_id, number)) for number in numbers]
     if any(p is None or p["source_sha256"] != doc["source_sha256"] or p["edition"] != doc["edition"]
@@ -346,11 +350,17 @@ def _bind(row, detail, registry, codes, cards, raw_pages, by_page, output):
                 and c["source_sha256"] == doc["source_sha256"] and c["edition"] == doc["edition"]]
     explicit = detail["locator"]
     reference = locator(detail["section"], explicit)
+    if numbered_page:
+        if explicit and (reference[0] not in (None, numbered_page[0])
+                         or point_number(reference) != point_number(numbered_page)):
+            raise ValueError("Пункт в колонке «Страницы PDF» расходится с местом в источнике")
+        reference = numbered_page
+    point = point_number(reference)
     excerpt = row["Выдержка"]
     method = "quote"
     matched = []
     try:
-        if explicit:
+        if explicit or point:
             found = None  # Явный локатор проверяется даже при совпадении цитаты в другом месте.
         else:
             found = _exact(eligible, pages, raw_pages, doc_id, numbers, engine, variant, excerpt, output)
@@ -381,6 +391,11 @@ def _bind(row, detail, registry, codes, cards, raw_pages, by_page, output):
             _navigation(row, detail, eligible, possible, pair, doc)
         detail["candidates"] = candidates(eligible, numbers, detail["section"], excerpt, matched)
         raise
+    if point:
+        exact = _chunk(chunk, f"Пункт {point}", [engine], [pair], parts,
+                       "table" if parts[0].get("tables") else chunk["kind"], chunk.get("condition", ""))
+        chunk = output.setdefault(exact["id"], exact)
+        detail["source_point"] = point
     detail["match_method"] = method
     source_pages = sorted({part["page"] for part in parts})
     excerpt = "\n".join(part["text"] for part in parts)

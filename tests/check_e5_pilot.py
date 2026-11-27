@@ -115,6 +115,13 @@ def score_case(case, lookups, excerpts, reply):
     if link_errors or reply.get("warnings"):
         failures.append("source_error")
 
+    work_texts = [step["text"] for step in reply.get("inspection_steps", ()) if step["role"] == "work"]
+    displayed = [_clean(text) for text in [reply["text"], *work_texts]]
+    forbidden_terms = [term for term in case.get("forbidden_answer_terms", ())
+                       if any(_matches(text, [term]) for text in displayed)]
+    if forbidden_terms:
+        failures.append("forbidden_answer_content")
+
     forbidden = {_key(ref) for ref in case.get("forbidden_sources", [])}
     observed = {_key(hit) for group in lookups for hit in group}
     observed.update(_key(ref) for ref in [*excerpts, *reply["sources"]])
@@ -140,6 +147,7 @@ def score_case(case, lookups, excerpts, reply):
                    "all_facts": all(check["in_answer"] for check in checks) if checks else None,
                    "link_errors": link_errors, "warnings": reply.get("warnings", [])},
         "inapplicable_sources": [_source(ref) for ref in foreign_pages],
+        "forbidden_answer_content": forbidden_terms,
         "facts": checks, "failures": list(dict.fromkeys(failures)),
     }
 
@@ -184,6 +192,9 @@ def validate_cases(cases, machines):
                 raise ValueError(f"{key}: укажите непустой список строк terms.")
             if not sources or not _valid_sources(sources):
                 raise ValueError(f"{key}: укажите документ и физическую страницу для каждого факта.")
+        forbidden_terms = case.get("forbidden_answer_terms", [])
+        if not isinstance(forbidden_terms, list) or not all(_nonempty(term) for term in forbidden_terms):
+            raise ValueError(f"{key}: укажите строки в forbidden_answer_terms.")
         forbidden = case.get("forbidden_sources", [])
         if not _valid_sources(forbidden):
             raise ValueError(f"{key}: проверьте документ и физическую страницу в forbidden_sources.")

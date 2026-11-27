@@ -218,6 +218,67 @@ class ExpertSourcesTest(unittest.TestCase):
                 _, report = self.run_import(records, [c], [p])
                 self.assertEqual([1, 1], [report["counts"]["bound"],report["counts"]["review"]])
 
+    def test_page_column_accepts_numbered_point_and_physical_page(self):
+        self.registry[0]["page_count"] = 217
+        adjacent = "Снять контрольную крышку и заменить прокладку корпуса фильтра."
+        body = f"11.6 {self.source}\n11.7 {adjacent}"
+        page = dict(self.page, page=216, page_count=217, text=body)
+        chunk = _chunk(page, "Проверка", ["ЯМЗ-536"], None,
+                       [dict(page=216, text=body)], "text")
+        reference = "п. 11.6 на стр. 216"
+        rows = [self.edited(**{"Страницы PDF": value}) for value in (
+            reference, "п. 11.7 на стр. 216", "п. 11.6 на стр. 218", "п. 11.6 без страницы 216"
+        )]
+        chunks, report = self.run_import(rows, [chunk], [page])
+        confirmed, wrong_point, outside_pdf, malformed = report["rows"]
+        self.assertEqual((confirmed["result"], confirmed.get("source_pages")), ("bound", [216]))
+        self.assertEqual(wrong_point["result"], "review")
+        self.assertEqual(outside_pdf["result"], "review")
+        self.assertEqual(malformed["result"], "review")
+        by_id = {item["id"]: item for item in chunks}
+        point = by_id[confirmed["chunk_id"]]
+        self.assertNotEqual(point["id"], chunk["id"])
+        self.assertEqual(point["source_pages"], [216])
+        self.assertEqual([part["page"] for part in point["page_parts"]], [216])
+        binding, = point["fault_bindings"]
+        for value in (point["text"], point["embedding_text"], point["page_parts"][0]["text"], binding["excerpt"]):
+            self.assertIn(self.source, value)
+            self.assertNotIn(adjacent, value)
+        full_page = by_id[chunk["id"]]
+        self.assertIn(adjacent, full_page["text"])
+        self.assertFalse(full_page.get("fault_bindings"))
+
+    def test_page_column_limits_search_to_the_numbered_table_row(self):
+        self.registry[0]["page_count"] = 217
+        table = {"rows": [
+            ["Причины неисправности", "Способ устранения"],
+            ["11.6 Шум в районе турбокомпрессора", "Проверить крепление соединительных рукавов."],
+            ["11.7 Неисправны форсунки", "Выполнить тест форсунок на стенде."],
+        ]}
+        body = "\n".join(" | ".join(row) for row in table["rows"])
+        page = dict(self.page, page=216, page_count=217, text=body)
+        chunk = _chunk(page, "Таблица 3", ["ЯМЗ-536"], None,
+                       [dict(page=216, text=body, tables=[table])], "table")
+        records = [self.edited(**{"Страницы PDF": "п. 11.6 на стр. 216", "Выдержка": text})
+                   for _, text in table["rows"][1:]]
+        chunks, report = self.run_import(records, [chunk], [page])
+        correct, wrong = report["rows"]
+        self.assertEqual((correct["result"], correct.get("source_pages")), ("bound", [216]))
+        self.assertEqual(wrong["result"], "review")
+        by_id = {item["id"]: item for item in chunks}
+        point = by_id[correct["chunk_id"]]
+        self.assertNotEqual(point["id"], chunk["id"])
+        self.assertEqual(point["source_pages"], [216])
+        binding, = point["fault_bindings"]
+        values = (point["text"], point["embedding_text"], json.dumps(point["page_parts"], ensure_ascii=False),
+                  binding["excerpt"])
+        for value in values:
+            self.assertIn("Проверить крепление соединительных рукавов.", value)
+            self.assertNotIn("Выполнить тест форсунок на стенде.", value)
+        full_page = by_id[chunk["id"]]
+        self.assertIn("Выполнить тест форсунок на стенде.", full_page["text"])
+        self.assertFalse(full_page.get("fault_bindings"))
+
     def test_paraphrase_with_numbered_step_in_section_and_no_variant_column(self):
         self.headers.remove("Исполнение")
         self.row.pop(4)
@@ -231,7 +292,8 @@ class ExpertSourcesTest(unittest.TestCase):
         chunks, report = self.run_import([row], [chunk], [page])
         self.assertEqual(report["counts"]["bound"], 1)
         self.assertEqual(report["rows"][0]["match_method"], "locator")
-        link, = chunks[0]["fault_bindings"]
+        point = next(c for c in chunks if c["id"] == report["rows"][0]["chunk_id"])
+        link, = point["fault_bindings"]
         self.assertEqual(link["source_pages"], [2])
         self.assertIn(self.source, link["excerpt"])
         self.assertNotIn("Снять манометр", link["excerpt"])

@@ -268,11 +268,15 @@ async function requestAnswer(isDiagnostic) {
     } else {
       const ask = message("Вы"); ask.append(node("p",question)); log.append(ask);
       if (el("question").value.trim() === question) el("question").value = "";
+      if ("context_id" in reply && reply.context_id !== orderDesk.current()) {
+        orderDesk.clear(false);
+        orderDesk.attach(reply);
+      }
     }
     topic = reply.topic || "";
     render(reply, isDiagnostic);
     if (reply.order_context_changed) {
-      orderDesk.clear();
+      orderDesk.clear(false);
       feedback("Данные ML изменились. Для новой заявки запросите диагностику ещё раз.");
     } else feedback();
   } catch (e) {

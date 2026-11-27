@@ -130,12 +130,12 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m uvicorn mock_toir.app:app --host 127.0.0.1 --port 8002
 ```
 
-В третьем терминале из корня проекта запустите чат с индексом шести руководств.
+В третьем терминале из корня проекта запустите чат. Псевдоним `mechanic_hackathon` указывает на принятый индекс шести руководств.
 
 ```powershell
 $env:MOCK_ML_URL = 'http://127.0.0.1:8001'
 $env:MOCK_TOIR_URL = 'http://127.0.0.1:8002'
-.\.venv\Scripts\python.exe -X utf8 -m ai_mechanic.web --qdrant-url http://127.0.0.1:6335 --collection mechanic_hackathon_expert_chat
+.\.venv\Scripts\python.exe -X utf8 -m ai_mechanic.web --qdrant-url http://127.0.0.1:6335 --collection mechanic_hackathon
 ```
 
 Откройте [чат](http://127.0.0.1:8765/). Выберите машину `H275AA47` и проверку `S-0139`. Нажмите «Получить диагностику», откройте ссылку на руководство и просмотрите заявку. При необходимости отредактируйте её и подтвердите отправку. Номер появится в чате и истории машины. Черновики и отправленные заявки хранятся в `data/state/work_orders.sqlite`.

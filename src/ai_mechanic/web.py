@@ -1,6 +1,7 @@
 """Веб-чат механика. Запуск из корня проекта: python -m ai_mechanic.web."""
 
 import argparse
+from dataclasses import dataclass, replace
 from functools import partial
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,7 +16,27 @@ from urllib.parse import quote, unquote, urlsplit
 
 import pymupdf
 
-from .ask import ManualSession
+from .ask import ManualSession, _validated_result
+from .knowledge.clutch_yamz236 import (
+    CLUTCH_CHECK_ID, CLUTCH_TOPIC, clutch_observation_report, clutch_order_basis, clutch_overview_question,
+)
+from .knowledge.f06_clutch import clutch_observation_question
+from .knowledge.diagnostic_works import CHAIN_INSPECTION_TOPIC, chain_observation_question
+from .knowledge.generator_bearing import GENERATOR_BEARING_TOPIC, generator_observation_question
+from .knowledge.generator_gearbox import gearbox_observation_question, gearbox_overview_question
+from .knowledge.oil_observation_state import OilObservations
+from .knowledge.valve_belt_checks import BELT_TOPIC, belt_drive_in, belt_observation_question
+from .knowledge.yamz236_oil import (
+    OIL_MEASUREMENT_CONFIRMED_TOPIC, OIL_MEASUREMENT_TOPIC, OIL_WORK_SOURCES, oil_observation_question,
+)
+from .knowledge.yamz536_oil import (
+    YAMZ536_OIL_CONFIRMED_TOPIC, YAMZ536_OIL_NORM_SOURCE, YAMZ536_OIL_TOPIC, yamz536_oil_observation_question,
+)
+from .knowledge.zmz40904_oil import ZMZ40904_OIL_CONFIRMED_TOPIC, ZMZ40904_OIL_TOPIC, zmz40904_oil_observation_question
+from .knowledge.zmz5234_oil_knock import (
+    ZMZ5234_CHECK_ID, ZMZ5234_OIL_KNOCK_TOPIC, ZMZ5234_REPAIR_CONFIRMED_TOPIC, ZMZ5234_REPAIR_SOURCE,
+    ZMZ5234_REPAIR_WORK, zmz5234_oil_observation_question,
+)
 from .knowledge.search import SearchUnavailable, add_search_arguments, configured_search
 from .ml_client import MLUnavailable, fetch_diagnosis
 from .work_order_service import OrderServiceError, submit_order
@@ -52,6 +73,64 @@ def _manual_url(doc_id):
     return "/manuals/" + quote(doc_id, safe="")
 
 
+_OBSERVATIONS = {
+    CLUTCH_TOPIC: ("F06", clutch_observation_report),
+    CHAIN_INSPECTION_TOPIC: ("F14", chain_observation_question),
+    GENERATOR_BEARING_TOPIC: ("F05", generator_observation_question),
+    OIL_MEASUREMENT_TOPIC: ("F02", oil_observation_question),
+    YAMZ536_OIL_TOPIC: ("F02", yamz536_oil_observation_question),
+    ZMZ40904_OIL_TOPIC: ("F02", zmz40904_oil_observation_question),
+    ZMZ5234_OIL_KNOCK_TOPIC: ("F02", zmz5234_oil_observation_question),
+    "clutch-noise": ("F06", clutch_observation_question),
+    "gearbox-noise": ("F07", gearbox_observation_question),
+    BELT_TOPIC: ("F04", belt_observation_question),
+}
+
+
+def _observation_rule(topic, engine):
+    family = (topic or "").partition(":")[0]
+    if family == CLUTCH_TOPIC and engine != "ЯМЗ-236М2":
+        return None
+    if family == CHAIN_INSPECTION_TOPIC and engine != "ЗМЗ-40905.10":
+        return None
+    if family == BELT_TOPIC and engine != "ЯМЗ-236М2":
+        return None
+    if family == GENERATOR_BEARING_TOPIC and engine != "ЗМЗ-5234.10":
+        return None
+    if family == OIL_MEASUREMENT_TOPIC and engine != "ЯМЗ-236М2":
+        return None
+    if family == YAMZ536_OIL_TOPIC and engine != "ЯМЗ-536":
+        return None
+    if family == ZMZ40904_OIL_TOPIC and engine != "ЗМЗ-40904.10":
+        return None
+    if family == ZMZ5234_OIL_KNOCK_TOPIC and engine != "ЗМЗ-5234.10":
+        return None
+    return _OBSERVATIONS.get(family)
+
+
+_OIL_OBSERVATION_TOPICS = {OIL_MEASUREMENT_TOPIC, YAMZ536_OIL_TOPIC, ZMZ40904_OIL_TOPIC}
+
+
+@dataclass(frozen=True)
+class _Observation:
+    """Хранит уточнение механика и заявки, обоснованные этим уточнением."""
+    topic: str
+    contexts: frozenset[str]
+    drive: str | None = None
+    oil: OilObservations | None = None
+
+    @classmethod
+    def from_reply(cls, topic, wording, cid, previous=None):
+        contexts = frozenset({cid}) if cid else frozenset()
+        if previous and cid in previous.contexts:
+            contexts = previous.contexts
+        drive = belt_drive_in(wording) if cid and topic == BELT_TOPIC else None
+        oil = None
+        if topic.partition(":")[0] in _OIL_OBSERVATION_TOPICS:
+            oil = previous.oil if previous else OilObservations()
+        return cls(topic, contexts, drive, oil)
+
+
 def _work_text(text):
     return " ".join(text.casefold().split()).rstrip(".!?")
 
@@ -66,6 +145,7 @@ class Workshop:
         settings = self.session()
         self.machines = {m["machine_id"]: m for m in settings.machines}
         self.diagnostics = {}
+        self.observations = {}
         self.diagnostics_lock = Lock()
         self.orders = WorkOrders(partial(submit_order, toir_url), root / orders_db,
                                  owns_check=self._owns_check, verify_works=self._verify_works)
@@ -91,24 +171,41 @@ class Workshop:
         machine = self.machines.get(machine_id)
         return bool(machine and any(c["check_id"] == check_id for c in machine["history"]))
 
-    def _stored_diagnosis(self, machine_id, check_id):
-        with self.diagnostics_lock:
-            return self.diagnostics.get((machine_id, check_id))
-
     def _verify_works(self, machine_id, check_id, works, sources):
         """Повторно проверяет поддерживающую процедуру для изменённого списка работ."""
-        diagnostic = self._stored_diagnosis(machine_id, check_id)
+        selection = machine_id, check_id
+        with self.diagnostics_lock:
+            diagnostic = self.diagnostics.get(selection)
+            observed = self.observations.get(selection)
         if not diagnostic:
             raise ValueError("Получите диагностику заново перед изменением работ.")
         session = self.session()
         related = {}
         for work in works:
+            if observed:
+                session.selection, session.topic = selection, observed.topic
             reply = session.ask(machine_id, work, check_id=check_id, diagnosis=diagnostic)
             cited = {(s["document_id"], s["page"]): s for s in reply["sources"]}
             matches = [cited[(step["document_id"], step["page"])]
                        for step in reply.get("inspection_steps", [])
                        if step["role"] == "work" and _work_text(step["text"]) == _work_text(work)
                        and (step["document_id"], step["page"]) in cited]
+            if observed and observed.topic.startswith("gearbox-noise:") and session.topic != observed.topic:
+                matches = []
+            if observed and observed.topic == BELT_TOPIC and belt_drive_in(work) != observed.drive:
+                matches = []
+            if matches and observed and observed.topic == YAMZ536_OIL_CONFIRMED_TOPIC:
+                if session.topic != observed.topic or YAMZ536_OIL_NORM_SOURCE not in cited:
+                    raise ValueError("Сверьте физическую страницу 49 с нормой давления масла перед изменением работ.")
+                matches.append(cited[YAMZ536_OIL_NORM_SOURCE])
+            if observed and observed.topic == ZMZ40904_OIL_CONFIRMED_TOPIC and session.topic != observed.topic:
+                matches = []
+            if check_id == ZMZ5234_CHECK_ID and _work_text(work) == _work_text(ZMZ5234_REPAIR_WORK):
+                if not observed or observed.topic != ZMZ5234_REPAIR_CONFIRMED_TOPIC:
+                    matches = []
+                else:
+                    matches = [source for source in matches
+                               if (source["document_id"], source["page"]) == ZMZ5234_REPAIR_SOURCE]
             if not matches:
                 raise ValueError(f"Не найдена подтверждённая процедура для работы «{work}». Проверьте её по руководству.")
             for source in matches:
@@ -122,6 +219,11 @@ class Workshop:
                     for source in sources:
                         if (source["document_id"], source["page"]) == key:
                             related[key] = source
+        if observed and observed.topic == OIL_MEASUREMENT_CONFIRMED_TOPIC and not OIL_WORK_SOURCES <= related.keys():
+            raise ValueError("Для проверки системы смазки нужны физические страницы 4 и 53 руководства.")
+        if check_id == CLUTCH_CHECK_ID and diagnostic.get("anomaly_type") == "F06":
+            if not observed or not clutch_order_basis(observed.topic, works, related):
+                raise ValueError("Сверьте наблюдения и страницы руководства для выбранной работы по сцеплению.")
         return list(related.values())
 
     def answer(self, path, data):
@@ -135,12 +237,16 @@ class Workshop:
             raise ValueError("В истории выбранной машины нет этой проверки.")
 
         selection = machine_id, check_id
-        diagnostic = self._stored_diagnosis(*selection) if check_id else None
+        with self.diagnostics_lock:
+            diagnostic = self.diagnostics.get(selection)
+            observed = self.observations.get(selection)
         session = self.session()
+        observation_answer = False
+        oil = None
         if requested:
             if data.get("previous_context_id"):
                 self.orders.invalidate(_field(data, "previous_context_id"))
-            diagnostic = self.fetch(*selection)
+            diagnostic = _validated_result(self.fetch(*selection), machine, check_id)
             question = (diagnostic["anomaly_title"] or "Результат диагностики") + (
                 ". Что уточнить у водителя и что проверить на двигателе?"
             )
@@ -150,9 +256,19 @@ class Workshop:
             if previous:
                 # Тема относится только к ранее выбранной паре машины и проверки.
                 state = json.loads(previous)
-                if isinstance(state, list) and len(state) == 3 and tuple(state[:2]) == selection and isinstance(state[2], str):
+                if (isinstance(state, list) and len(state) == 3 and tuple(state[:2]) == selection
+                        and isinstance(state[2], str) and not _observation_rule(state[2], machine["engine_model"])):
                     session.selection = selection
                     session.topic = state[2]
+            if observed:
+                code, recognizes = _OBSERVATIONS[observed.topic.partition(":")[0]]
+                observation_answer = recognizes(question)
+                if observed.oil is not None:
+                    oil = observed.oil.with_report(question)
+                clutch_followup = observed.topic.partition(":")[0] == CLUTCH_TOPIC and clutch_overview_question(question)
+                if (not session.topic or observation_answer or clutch_followup
+                        or code == "F07" and gearbox_overview_question(question)):
+                    session.selection, session.topic = selection, observed.topic
 
         if requested and diagnostic["status"] == "normal" and diagnostic["signal_quality"] != "bad":
             text = "По результату ML отклонений не обнаружено."
@@ -171,16 +287,46 @@ class Workshop:
             source["page_url"] = f"{base}/page/{page}"
         reply["topic"] = json.dumps([*selection, session.topic], ensure_ascii=False) if session.topic else ""
         reply["diagnosis"] = diagnostic
+        rule = _observation_rule(session.topic, machine["engine_model"])
         if requested:
             with self.diagnostics_lock:
-                reply["context_id"] = self.orders.open_context(*selection, diagnostic, reply)
+                cid = self.orders.open_context(*selection, diagnostic, reply)
+                reply["context_id"] = cid
                 self.diagnostics[selection] = diagnostic
-        elif data.get("context_id"):
-            cid = _field(data, "context_id")
-            reply["order_context_changed"] = not self.orders.refresh(cid, *selection, diagnostic)
+                if (rule and diagnostic.get("anomaly_type") == rule[0] and diagnostic.get("status") == "anomaly"
+                        and diagnostic.get("signal_quality") in {"good", "warning"}):
+                    self.observations[selection] = _Observation.from_reply(
+                        session.topic, diagnostic.get("description") or "", cid)
+                else:
+                    self.observations.pop(selection, None)
+        elif observed and observation_answer and rule and rule[0] == diagnostic.get("anomaly_type"):
+            with self.diagnostics_lock:
+                if self.diagnostics.get(selection) is not diagnostic or self.observations.get(selection) is not observed:
+                    raise ValueError("Диагностика или наблюдения изменились. Повторите уточнение.")
+                cid = self.orders.open_context(*selection, diagnostic, reply, observation_topic=session.topic)
+                reply["context_id"] = cid
+                state = _Observation.from_reply(session.topic, question, cid, observed)
+                self.observations[selection] = replace(state, oil=oil)
+        else:
+            if observed and oil is not None and oil != observed.oil:
+                with self.diagnostics_lock:
+                    if self.diagnostics.get(selection) is not diagnostic or self.observations.get(selection) is not observed:
+                        raise ValueError("Диагностика или наблюдения изменились. Повторите уточнение.")
+                    self.observations[selection] = replace(observed, oil=oil)
+            if data.get("context_id"):
+                cid = _field(data, "context_id")
+                reply["order_context_changed"] = not self.orders.refresh(cid, *selection, diagnostic)
         reply.pop("inspection_steps", None)
         return reply
 
+
+    def _diagnosis_for_copy(self, cid, machine_id, check_id):
+        """Сверяет основание повторной заявки с последними наблюдениями под блокировкой диагностики."""
+        selection = machine_id, check_id
+        observed = self.observations.get(selection)
+        if observed and cid not in observed.contexts:
+            raise ValueError("Состав этой заявки не подтверждён последним уточнением механика.")
+        return self.diagnostics.get(selection)
 
     def order(self, path, data):
         """Меняет показанный черновик или отправляет подтверждённую версию."""
@@ -209,7 +355,13 @@ class Workshop:
         if type(revision) is not int or revision < 1:
             raise ValueError("Нужна версия показанного черновика.")
         if path == "/api/orders/new":
-            return self.orders.new_from_sent(context, revision, self._stored_diagnosis)
+            with self.diagnostics_lock:
+                snapshot = self.orders.new_from_sent(context, revision, partial(self._diagnosis_for_copy, context))
+                selection = snapshot["machine_id"], snapshot["check_id"]
+                observed = self.observations.get(selection)
+                if observed:
+                    self.observations[selection] = replace(observed, contexts=observed.contexts | {snapshot["context_id"]})
+                return snapshot
         draft = _field(data, "draft_id")
         if path == "/api/orders/send":
             return self.orders.send(context, draft, revision, data.get("confirmed") is True)

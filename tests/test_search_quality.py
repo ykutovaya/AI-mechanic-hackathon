@@ -73,6 +73,25 @@ class SearchReportTests(unittest.TestCase):
         cited = score_case(case, [[fact]], [fact], {**GOOD_REPLY, "sources": [citation(12), citation(21)]})
         self.assertIn("inapplicable_source", cited["failures"])
 
+    def test_excludes_premature_answer_or_work_but_allows_retrieval(self):
+        case = CASE | {"forbidden_answer_terms": ["замерить высоту шестерен", "40,075"]}
+        fact = passage(12, FACT)
+        other = passage(103, "Замерить высоту шестерён. Новые шестерни 40,075 мм.")
+        for answer, failed in (
+            (GOOD_REPLY, False),
+            (GOOD_REPLY | {"text": GOOD_REPLY["text"] + " Новые шестерни 40,075 мм."}, True),
+            (GOOD_REPLY | {"inspection_steps": [{"role": "work", "text": "Замерить высоту шестерён."}]}, True),
+        ):
+            with self.subTest(answer=answer):
+                result = score_case(case, [[fact, other]], [fact], answer)
+                self.assertEqual("forbidden_answer_content" in result["failures"], failed)
+
+    def test_validates_forbidden_answer_terms(self):
+        machines = {"V1": {"history": [{"check_id": "S1"}]}}
+        for invalid in ("40,075", [" "], [None]):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                validate_cases([CASE | {"forbidden_answer_terms": invalid}], machines)
+
     def test_rejects_ambiguous_or_malformed_forbidden_pages(self):
         machines = {"V1": {"history": [{"check_id": "S1"}]}}
         for forbidden in ([source(0)], [source(12)], "guide", [{}]):

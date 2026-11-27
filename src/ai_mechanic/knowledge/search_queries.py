@@ -15,6 +15,36 @@ def mentions_pressure_drop(text):
     return bool(re.search(rf"\b{direction}\s+{pressure}\b|\b{pressure}(?:\s+масла)?\s+(?:{direction}|ниже)\b", text))
 
 
+def inspection_followup(code, question):
+    """Узнаёт общий вопрос о текущем отклонении, сохраняя явно заданную тему."""
+    subjects = {
+        "F02": ("давлен", "масл", "низк", "понижен", "паден", "предупрежд"),
+        "F06": ("сцеплен", "признак", "неисправност", "симптом", "случа", "моём", "моем"),
+        "F03": ("перегре", "охлаждающ", "жидкост", "подозрен", "масл", "антифриз", "ож"),
+        "F08": ("дизел", "топлив", "подач", "систем"),
+        "F13": ("бензин", "топлив", "подач", "поступ", "подаёт", "подает", "систем", "питани", "моём", "моем", "случае"),
+    }
+    if code not in subjects or not re.search(r"провер|осмотр|предупрежд|с чего начать", question):
+        return False
+    if code == "F02" and not ("давлен" in question and "масл" in question
+                              and (mentions_pressure_drop(question) or "предупрежд" in question)):
+        return False
+    if code == "F06" and "сцеплен" not in question:
+        return False
+    if code == "F03" and "перегре" not in question:
+        return False
+    if code == "F08" and not ("дизел" in question and "топлив" in question):
+        return False
+    if code == "F13" and not re.search(r"бензин|топливоподач|подач\w*\s+топлив|систем\w*\s+питания", question):
+        return False
+    common = ("провер", "осмотр", "начать", "двигател", "машин", "диагност", "результат",
+              "перв", "очеред", "сначал", "нужн", "требуют", "рекоменд", "подскаж", "каки", "како")
+    words = re.findall(r"[а-яёa-z0-9]+", question)
+    service = {"а", "и", "в", "во", "на", "по", "к", "у", "с", "со", "о", "об", "для", "при",
+               "как", "что", "чего", "если", "даны", "этой", "этот", "этом", "этого", "эту"}
+    return all(word in service or word.startswith(subjects[code] + common) for word in words)
+
+
 def followup_queries(question):
     """Дополняет широкий вопрос поиском по отдельным темам в том же руководстве."""
     q = question.casefold().replace("ё", "е")

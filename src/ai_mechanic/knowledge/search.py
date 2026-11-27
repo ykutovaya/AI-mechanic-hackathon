@@ -8,16 +8,36 @@ import unicodedata
 
 from qdrant_client.http.exceptions import ApiException
 
-from .expert_answers import generic_diagnostic_question, select_fault_evidence
+from .expert_answers import asks_if_fuel_pump_needs_disassembly, generic_diagnostic_question, select_fault_evidence
+from .diesel_timing import select_injection_timing
+from .valve_belt_checks import BELT_TOPIC, VALVE_TOPIC, check_zmz_belts, select_belt_check, select_valve_check
+from .diagnostic_works import (
+    CHAIN_CHECK_ID, chain_knock_confirmed, select_chain_dialogue, select_diagnostic_work, select_tensioner_source,
+)
+from .diagnostic_clarifications import clarify_diagnostic_basis
+from .generator_gearbox import select_generator_gearbox
+from .clutch_yamz236 import CLUTCH_CHECK_ID, select_yamz_clutch
+from .f06_clutch import clarify_idle_clutch_noise, select_clutch_mounting
+from .f10_compressor import select_compressor_drive
+from .f11_egr import select_egr_inspection
+from .ignition import select_ignition_contacts
+from .injector_test import select_injector_test, select_yamz236_injector_reference
 from .figure_legends import select_figure_positions
 from .normative_tables import select_normative_rows
 from .oil_maintenance import select_oil_maintenance
+from .yamz236_oil import (OIL_CHECK_ID, OIL_MEASUREMENT_TOPIC, select_oil_measurement,
+                         yamz236_low_pressure_evidence)
+from .yamz536_oil import YAMZ536_CHECK_ID, YAMZ536_OIL_TOPIC, select_yamz536_oil_measurement
+from .zmz40904_oil import ZMZ40904_CHECK_ID, ZMZ40904_OIL_TOPIC, select_zmz40904_oil_measurement
+from .zmz5234_oil_knock import ZMZ5234_CHECK_ID, ZMZ5234_OIL_KNOCK_TOPIC, select_zmz5234_oil_knock
+from .temperature_pressure_checks import (asks_about_oil_indicator, select_cooling_checks, select_dipstick_check,
+                                          select_indexed_oil_indicator)
 from .defect_card import select_defect_card
 from .component_limits import select_component_limit
 from .workshop_instructions import installation_torque, select_workshop_instruction
 from .qdrant_chunks import extract_span
 from ._qdrant_store import COLLECTION, URL, QdrantSearch
-from .search_queries import FUEL_SYSTEM, OIL_LEVEL, OIL_SIGNAL, mentions_pressure_drop
+from .search_queries import FUEL_SYSTEM, OIL_LEVEL, OIL_SIGNAL, inspection_followup, mentions_pressure_drop
 
 
 class SearchUnavailable(RuntimeError):
@@ -79,6 +99,17 @@ class _Search:
             self.results[query] = hits
         return self.results[query]
 
+    def exact_page(self, document, page, code):
+        """Читает конкретную страницу при пропуске доказательства в ранжированной выдаче."""
+        if not callable(getattr(type(self.backend), "page_hits", None)):
+            return []
+        self.queries.append(f"{document} · PDF {page}")
+        try:
+            hits = self.backend.page_hits(self.engine, document, page, variant=self.variant, code=code)
+        except (ApiException, OSError, ValueError, RuntimeError) as exc:
+            raise SearchUnavailable("Не удалось получить страницу руководства из Qdrant.") from exc
+        return [hit for hit in hits if not self.manual_type or self.manual_type.search(hit.get("title", ""))]
+
     def find(self, query):
         # Общий вопрос сохраняет контекст, отдельный запрос находит условия и шаги разных разделов.
         hits = []
@@ -112,8 +143,10 @@ class _Search:
                 source.pop("fault_code", None)
             self.add(source, part["text"], kind=kind, work=work)
 
-    def passage(self, query, pattern, *, kind="fact", explain=None, work=None, lamp=False):
+    def passage(self, query, pattern, *, kind="fact", explain=None, work=None, lamp=False, document_id=None):
         for hit in self.find(query):
+            if document_id and hit["document_id"] != document_id:
+                continue
             match = re.search(pattern, _clean(hit["text"]), re.I)
             if match:
                 excerpt = match.group()
@@ -139,6 +172,14 @@ def _oil_grades(search):
     tables_for_oil = set()
     for hit in hits:
         body = hit["text"]
+        if hit["document_id"] == "yamz-236m2-re-2010":
+            seasonal = re.search(
+                r"При работе двигателя летом\s*\(при температуре воздуха выше плюс 5[º°]\s*[СC]\)"
+                r"\s*применять:\s*[−–-]?\s*моторное масло\s+[^.]{1,80}\.\s*"
+                r"Зимой\s*\(при температуре воздуха ниже плюс 5[º°]\s*[СC]\)"
+                r"\s*:\s*[−–-]?\s*моторное масло\s+[^.]{1,80}\.", _clean(body), re.I)
+            if seasonal:
+                search.add(hit, seasonal.group())
         grades = re.search(r"(?:Масла моторные|Моторные масла)\s+по ГОСТ[^\n:]*:"
                            r"(?:[ \t]*\n[ \t]*М[-–][^\n]+)+", body, re.I)
         if grades:
@@ -168,12 +209,19 @@ def _oil_grades(search):
 
 
 def _level(search, kind="fact"):
-    found = search.passage("обслуживание системы смазки",
-                          r"Проверять уровень масла необходимо.{1,550}?не превышая её\.",
-                          kind=kind, work="Проверить уровень масла по руководству.", explain=lambda excerpt: (
-                              f"{excerpt} По уровню масла фактическое давление определить нельзя."))
-    if found:
+    if select_dipstick_check(search, kind):
         return True
+    queries = ["обслуживание системы смазки"]
+    if search.engine == "ЗМЗ-5234.10":
+        queries.append("Проверять уровень масла необходимо на ровной горизонтальной площадке "
+                       "после остановки двигателя не менее 10 минут")
+    for query in queries:
+        found = search.passage(query,
+                              r"Проверять уровень масла необходимо.{1,550}?не превышая её\.",
+                              kind=kind, work="Проверить уровень масла по руководству.", explain=lambda excerpt: (
+                                  f"{excerpt} По уровню масла фактическое давление определить нельзя."))
+        if found:
+            return True
     for hit in search.find(OIL_LEVEL):
         title = _clean(hit.get("section", "")).casefold()
         if hit.get("kind") == "procedure" and "проверк" in title and "уровн" in title and "масл" in title:
@@ -197,13 +245,41 @@ def _asks_pressure_measurement(q, oil_context):
     if re.search(rf"\b{action}\s+(?:(?:фактическое|реальное)\s+)?{subject}", q) or re.search(
             rf"{subject}\s+(?:в двигателе\s+)?(?:можно\s+)?{action}\b", q):
         return True
+    # Вопрос о манометре может ссылаться на давление, названное в предыдущей фразе.
+    if "манометр" in q:
+        clauses = [part.strip() for part in re.split(r"[.!?]+", q) if part.strip()]
+        ask = r"(?:как|чем|можно ли)\s+(?:его\s+)?(?:измерить|замерить)(?:\s+его)?(?:\s+манометром)?"
+        for index, clause in enumerate(clauses):
+            if re.fullmatch(ask, clause) and (index > 0 and re.search(subject, clauses[index - 1])
+                                              or index == 0 and len(clauses) == 1 and oil_context):
+                return True
     # Короткое уточнение без названия жидкости допустимо только после вопроса о масле.
     return bool(oil_context and re.fullmatch(
         rf"(?:а\s+)?(?:как|чем|можно(?: ли)?)\s+{action}\s+(?:его\s+)?давление[?!. ]*", q.strip()))
 
 
+_OIL_MEASUREMENT_MISSING = "Процедура контрольного замера давления масла в найденных фрагментах не указана."
+
+
+def _yamz_536_pressure_measurement(search):
+    """Берёт из пункта 14.2 контрольный замер и оставляет замену условной."""
+    work = "Проверить давление масла эталонным манометром или диагностическим прибором."
+    return search.passage(
+        "Проверить давление масла эталонным манометром или диагностическим прибором",
+        r"14\.2\s+Неисправен датчик или указатель давления\s*\(дублирующие приборы\)\s*(?:\|\s*)?"
+        r"Проверить давление масла эталонным манометром или диагностическим прибором,\s*"
+        r"при необходимости,?\s+заменить датчик или указатель давления",
+        explain=lambda _: (
+            f"{work} Если проверка подтвердит неисправность датчика или указателя, замените неисправный прибор."
+        ),
+        work=work,
+    )
+
+
 def _pressure_measurement(search):
     """Возвращает процедуру замера либо описание штатных приборов из руководства."""
+    if search.engine == "ЯМЗ-536" and _yamz_536_pressure_measurement(search):
+        return True
     subject = r"давления масла(?: в (?:двигателе|системе смазки(?: двигателя)?))?"
     for hit in search.find("Измерение давления масла контрольным манометром"):
         if hit.get("kind") == "procedure" and re.fullmatch(
@@ -216,32 +292,39 @@ def _pressure_measurement(search):
         explain=lambda excerpt: f"{excerpt} Порядок контрольного замера отдельным манометром в этом описании не приведён.")
 
 
-def _causes_from_heading(search, hits):
-    """Собирает строки одной темы и оставляет условия на их физической странице."""
+_PRESSURE_GROUP = re.compile(
+    r"(?:Таблица\s+\d+(?:\.\d+)*\.?\s+)?(?:\d+(?:\.\d+)*[.)]?\s+)?"
+    r"(?:(?:пониженн|низк|недостаточн)\w*(?:\s+или\s+отсутствие)?\s+давлени\w*\s+масла"
+    r"|давление масла ниже нормы)(?:\s+в системе смазки)?(?:\s+двигателя)?[.:\s*]*", re.I)
+_CAUSE_COLUMN = re.compile(r"(?:(?:возможн|вероятн)\w*\s+)?причин\w*(?:\s+неисправности)?", re.I)
+
+
+def _causes_from_heading(search, hits, *, include_captions=False):
+    """Читает колонку причин между заголовками внутри исходной таблицы."""
     by_page = {}
     for hit in hits:
-        section = _clean(hit.get("section", "")).casefold()
-        if not re.search(r"(?:пониженн|низк|недостаточн)\w*\s+давлени\w*\s+масла\b"
-                         r"|\bдавление масла ниже\b", section):
-            continue
-        for table in hit.get("tables", []):
-            rows = table.get("rows", [])
+        tables = hit.get("tables", ())
+        first_line = (hit["text"].lstrip().partition("\n")[0]).strip(" \r\t|")
+        for table in tables:
+            rows = table.get("rows", ())
             if not rows:
                 continue
-            column = next((i for i, cell in enumerate(rows[0])
-                           if re.fullmatch(r"(?:возможн\w*\s+)?причин[а-яё]*(?:\s+неисправност[а-яё]*)?",
-                                           _clean(cell or "").casefold())), None)
+            column = next((i for i, cell in enumerate(rows[0]) if _CAUSE_COLUMN.fullmatch(_clean(cell or ""))), None)
             if column is None:
                 continue
-            causes = [_clean(row[column]) for row in rows[1:]
-                      if len(row) == len(rows[0]) and row[column] and sum(bool(c) for c in row) >= 2]
-            if not causes:
-                continue
-            note = re.search(r"(?:^|\n)[ \t]*\*+\s+(.+)\Z", hit["text"], re.S)
-            footnote = _clean(note[1]) if note else ""
-            key = (hit["document_id"], hit["page"], section, hit.get("condition", ""), footnote)
-            _, found = by_page.setdefault(key, (hit, []))
-            found.extend(causes)
+            # Номер и подпись самостоятельной таблицы могут стоять перед названиями колонок.
+            heading = first_line if include_captions and len(tables) == 1 and _PRESSURE_GROUP.fullmatch(first_line) else ""
+            for row in rows[1:]:
+                cells = [_clean(cell or "") for cell in row]
+                occupied = [cell for cell in cells if cell]
+                if len(occupied) == 1:
+                    heading = occupied[0] if _PRESSURE_GROUP.fullmatch(occupied[0]) else ""
+                elif heading and len(cells) == len(rows[0]) and cells[column]:
+                    note = re.search(r"(?:^|\n)[ \t]*\*+\s+(.+)\Z", hit["text"], re.S) if "*" in heading else None
+                    footnote = _clean(note[1]) if note else ""
+                    key = (hit["document_id"], hit["page"], hit.get("condition", ""), footnote)
+                    _, causes = by_page.setdefault(key, (hit, []))
+                    causes.append(cells[column])
     for key, (hit, causes) in by_page.items():
         text = " ".join(c.rstrip(" .") + "." for c in dict.fromkeys(causes))
         if key[-1]:
@@ -249,36 +332,64 @@ def _causes_from_heading(search, hits):
         search.add(hit, text, kind="cause")
 
 
+def _overheating_inspection(search, question, symptoms):
+    """Выбирает первичную проверку по признакам перегрева и применимой процедуре."""
+    if search.engine == "ЗМЗ-40905.10":
+        belt_question = "ремн" in question and "ролик" in question and "провер" in question
+        hot_belt = "ремн" in symptoms and re.search(
+            r"перегрев|рост\w*\s+температур|температур\w*\s+(?:раст|повыш)", symptoms)
+        if not (belt_question or hot_belt):
+            return None
+        search.passage(
+            "Предупреждения при загорании сигнализатора перегрева охлаждающей жидкости",
+            r"При загорании сигнализатора перегрева охлаждающей жидкости следует немедленно "
+            r"остановить двигатель, выявить и устранить причину перегрева\.",
+            kind="risk",
+        )
+        found = check_zmz_belts(search)
+        return "" if found else "В найденных фрагментах нет процедуры проверки ремней и роликов."
+
+    if search.engine == "ЯМЗ-536":
+        fan_question = re.search(r"провер\w*\s+(?:работу вентилятора|состояние муфты вентилятора)", question)
+        fan_stopped = re.search(r"вентилятор\w*\s+не\s+включа|не\s+включа\w*\s+вентилятор", symptoms)
+        if not (fan_question or fan_stopped):
+            return None
+        work = "Проверить работу вентилятора. При наличии муфты включения проверить её состояние."
+        found = search.passage(
+            "Не включается вентилятор при перегреве проверить состояние муфты вентилятора",
+            r"16\.5\s+Не включается или неисправен вентилятор с муфтой включения\b[^|]{1,220}\|\s*"
+            r"Проверить состояние муфты вентилятора\b",
+            explain=lambda _: work,
+            work=work,
+        )
+        return "" if found else "В найденных фрагментах нет проверки работы вентилятора для этого двигателя."
+
+    return select_cooling_checks(search, question, symptoms)
+
+def _pressure_warning_and_level(search):
+    """Отделяет предупреждение и проверку уровня от метода измерения давления."""
+    warning = search.passage(
+        OIL_SIGNAL,
+        r"Не допускается эксплуатация двигателя с горящим сигнализатором аварийного давления масла\."
+        r"(?: Это [^.!?]{1,300}\.)? Загорание сигнализатора допускается при [^.!?]{1,300}\.",
+        kind="risk", explain=lambda excerpt: (
+            f"{excerpt} По одному сигнализатору фактическое давление масла определить нельзя."
+        ),
+    )
+    if not warning:
+        _lamp(search, kind="risk")
+    _level(search)
+
+
 def _low_pressure(search, *, causes_only=False):
     if not causes_only:
-        _lamp(search, kind="risk")
-        _level(search)
+        _pressure_warning_and_level(search)
     hits = search.find("низкое давление масла")
-    _causes_from_heading(search, hits)
-    _oil_pump_inspection(search, causes_only)
-    for hit in hits:
-        for table in hit.get("tables", []):
-            causes = []
-            in_section = False
-            for row in table["rows"]:
-                cells = [_clean(cell) for cell in row if cell and cell.strip()]
-                if len(cells) == 1:
-                    if in_section:
-                        break
-                    in_section = cells[0].lower() == "низкое давление масла"
-                elif in_section and cells:
-                    causes.append(cells[0])
-            if causes:
-                excerpt = "Низкое давление масла. " + "; ".join(causes) + "."
-                statement = (". ".join(causes) + ". Если падение давления подтвердится, "
-                             "назначьте дефектовку системы смазки для установления причины.")
-                work = "При подтверждённом падении давления провести дефектовку системы смазки с учётом результатов проверки и таблицы причин."
-                search.add(hit, excerpt, text=". ".join(causes) + "." if causes_only else statement, kind="cause",
-                           work=None if causes_only else work)
-                break
-        else:
-            continue
-        break
+    _causes_from_heading(search, hits, include_captions=causes_only)
+    if not any(item["kind"] == "cause" for item in search.evidence):
+        search.passage("Падение давления в системе смазки может быть вызвано износом деталей масляного насоса",
+                       r"Падение давления в системе смазки может быть вызвано износом деталей "
+                       r"масляного насоса или подшипников коленчатого и распределительного валов\.", kind="cause")
     if causes_only:
         return
     search.passage("под давлением смазываются",
@@ -289,22 +400,30 @@ def _low_pressure(search, *, causes_only=False):
                        "Повреждение подшипников можно подтвердить при дефектовке."))
 
 
-def _oil_pump_inspection(search, causes_only):
-    """Связывает причину падения давления с проверкой деталей масляного насоса."""
-    cause = search.passage(
-        "Падение давления в системе смазки может быть вызвано износом деталей масляного насоса",
-        r"Падение давления в системе смазки может быть вызвано износом деталей "
-        r"масляного насоса или подшипников коленчатого и распределительного валов\."
-        r"(?: При значительных износах деталей насоса он начинает работать шумно\."
-        r" Чтобы выявить неисправности насоса, его необходимо снять с двигателя и разобрать\.)?",
-        kind="cause")
-    if cause and not causes_only:
-        search.passage(
-            "Разборка масляного насоса проверить износ шестерен замерив их высоту",
-            r"Проверить износ шестер[её]н, замерив их высоту\. Новые шестерни имеют размер высоты "
-            r"\d+,\d+\s*(?:[…–—-]|\.{2,3})\s*\d+,\d+ мм\."
-            r"(?: При значительном износе заменить дефектную шестерню\.)?",
-            work="Проверить износ шестерен масляного насоса, измерив их высоту.")
+def _asks_oil_pump_inspection(question):
+    """Выделяет прямой запрос механика о дефектовке снятого насоса и его шестернях."""
+    pump = re.search(r"маслян[а-яё]+ насос|маслонасос", question)
+    if not pump:
+        return False
+    gears = re.search(r"шестер[её]н", question) and re.search(r"износ|высот|измер|провер|замер", question)
+    on_bench = re.search(r"дефектовк|(?:сня[тл]|разобра)\w*", question) and re.search(r"как провер|что провер|дефектовк", question)
+    return bool(gears or on_bench)
+
+
+def _oil_pump_inspection(search):
+    """Приводит размер новых шестерён как справку для разборки, сохраняя привязку к насосу."""
+    origins = {(h["document_id"], h["page"]) for h in search.find("Масляный насос. Падение давления в системе смазки")
+               if re.search(r"износом деталей масляного насоса|разборка масляного насоса", _clean(h["text"]), re.I)}
+    for hit in search.find("Разборка масляного насоса проверить износ шестерен замерив их высоту"):
+        nearby = any(doc == hit["document_id"] and hit["page"] in (page, page + 1) for doc, page in origins)
+        if not nearby and not re.search(r"маслян\w* насос|маслонасос", _clean(hit.get("section", "") + " " + hit["text"]), re.I):
+            continue
+        check = re.search(r"Проверить износ шестер[её]н, замерив их высоту\. Новые шестерни имеют размер высоты "
+                          r"\d+,\d+\s*(?:[…–—-]|\.{2,3})\s*\d+,\d+ мм\.", _clean(hit["text"]), re.I)
+        if check:
+            search.add(hit, check.group())
+            return True
+    return False
 
 
 def _diagram_codes(question):
@@ -1111,6 +1230,46 @@ def _generic(search, question, engine):
                 return
 
 
+def _short_component_reference(search, question):
+    """Находит справку в разделе об узле или просит уточнить короткий запрос."""
+    subject = re.fullmatch(r"(?:что такое\s+)?([а-яё][а-яё-]{3,})", question.strip(" ?!."), re.I)
+    if not subject:
+        return None
+    stem = _stem(subject[1].casefold())
+    mentioned = False
+    best = None
+    best_score = -1
+    for hit in search.primary:
+        body = hit["text"]
+        if stem not in _clause_terms(body):
+            continue
+        mentioned = True
+        if hit.get("kind") in {"table", "figure"}:
+            continue
+        if stem not in _clause_terms(hit.get("section") or ""):
+            continue
+        sentences = re.split(r"(?<!\b[а-яёА-ЯЁ]\.)(?<=[.!?])\s+(?=[А-ЯЁ])", _clean(body))
+        excerpt = []
+        for sentence in sentences:
+            if (not re.fullmatch(r"[А-ЯЁ].{38,498}[.!?]", sentence)
+                    or re.match(r"(?:Рис|Табл)\b", sentence) or stem not in _clause_terms(sentence)):
+                if excerpt:
+                    break
+                continue
+            excerpt.append(sentence)
+            if len(excerpt) == 2:
+                break
+        if len(excerpt) > best_score and excerpt:
+            best = hit, " ".join(excerpt)
+            best_score = len(excerpt)
+    if best is not None:
+        search.add(*best, required=False)
+        return ""
+    if mentioned:
+        return "В руководстве есть упоминания по этому запросу. Уточните, какой узел или способ проверки вас интересует."
+    return None
+
+
 def _knock_causes(search):
     """Показывает примеры причин из таблицы, не перенося в ответ колонку ремонта."""
     for hit in search.find("Стуки в двигателе. Вероятная причина"):
@@ -1138,27 +1297,12 @@ def _knock_causes(search):
 def _knock_dialog(search, q):
     """Сопоставляет слова механика с условиями проверки из руководства."""
     _knock_causes(search)
-    clauses = re.split(r"[,;.!?]|\bно\b", q)
-    affirmative = " ".join(part for part in clauses if not re.search(r"\b(?:не|нет|без)\b", part))
-    location = re.search(r"\bкрышк\w*\s+(?:привода\s+)?цепи\b|передн\w*\s+крышк\w*\s+(?:головк\w*|гбц)", affirmative)
-    deceleration = re.search(r"\bрезк\w*\s+(?:сброс\w*|снижен\w*)\s+(?:оборот\w*|частот\w*\s+вращен\w*)", affirmative)
-    tentative = "?" in q or re.search(r"\b(?:может быть|возможно|кажется|если|или)\b", q)
-    if not (location and deceleration) or tentative:
+    if not chain_knock_confirmed(q):
         if re.search(r"\b(?:не могу определить|затрудняюсь|не знаю)\b", q):
             return ("По записи источник стука установить не удалось. Если стук повторится, "
                     "отметьте, откуда он слышен, обороты и нагрузку в этот момент."), True
         return "Источник стука не установлен. Откуда он слышен, при каких оборотах и нагрузке?", True
-    found = search.passage(
-        "Гидронатяжитель. Стук у крышки цепи при резком сбросе частоты вращения",
-        r"Гидронатяжитель подлежит проверке и ремонту при обнаружении стука в зоне передней крышки "
-        r"головки цилиндров и крышки цепи\.\s*Стук отч[её]тливо слышен при резком сбросе частоты вращения"
-        r".{0,150}?стетофонендоскопа.{0,180}?к пробке крышки верхнего или нижнего гидронатяжителя"
-        r".{0,500}?износ зв[её]здочек, повышенная вытяжка цепи, разрушение успокоителя цепи\.",
-        explain=lambda _: ("При таком стуке можно проверить гидронатяжитель. Руководство предлагает "
-                           "прослушать стук стетофонендоскопом у пробки крышки верхнего или нижнего "
-                           "гидронатяжителя. Возможны и другие причины — износ звёздочек, повышенная "
-                           "вытяжка цепи или разрушение успокоителя цепи."),
-        work="Прослушать стук у пробки крышки верхнего или нижнего гидронатяжителя стетофонендоскопом.")
+    found = select_tensioner_source(search, confirmed=True)
     clarification = "По словам механика, стук слышен у крышки цепи при резком сбросе оборотов. Причина остаётся неизвестной."
     if not found:
         clarification += " В найденных разделах руководства нет проверки для этих условий."
@@ -1331,6 +1475,22 @@ def _camshaft_clearance(search):
     return "В найденных фрагментах нет указания, куда вставить щуп для проверки осевого зазора распредвала."
 
 
+def _zmz_5234_valve_clearance(search):
+    """Выбирает способ измерения, условия и допуски из процедуры ЗМЗ-5234.10."""
+    number = r"\d+[.,]\d+"
+    interval = rf"{number}\s*(?:…|[–—-]|\.{{2,3}})\s*{number}\s*мм"
+    return search.passage(
+        "проверить зазор между коромыслом и стержнем клапана щупом на холодном двигателе",
+        r"(?:Медленно поворачивать коленчатый вал до совпадения риски на шкиве[^.]{20,180}\.\s*"
+        r"При этом положении впускной и выпускной клапаны первого цилиндра полностью закрыты\.\s*5\.\s*)?"
+        r"Проверить зазор между коромыслом и стержнем клапана с помощью щупа\.\s*"
+        rf"Зазор на холодном двигателе должен быть {interval}\."
+        r"(?:\s*Если на прогретом двигателе наблюдается непрерывный стук клапанов,\s*"
+        r"расположенных по краям головок,[^.]{1,320}?допускается уменьшить зазор до\s*"
+        rf"{interval} на холодном двигателе\.)?",
+        work="Проверить тепловые зазоры клапанов щупом на холодном двигателе.")
+
+
 def retrieve(backend, engine, question, diagnosis=None, topic="", *, variant=None, procedures=()):
     """Разбирает вопрос на поисковые фразы. Модель берётся из карточки машины."""
     q = re.sub(rf"(?<!\w){re.escape(engine)}(?!\w)", "", question, flags=re.I).casefold()
@@ -1338,22 +1498,27 @@ def retrieve(backend, engine, question, diagnosis=None, topic="", *, variant=Non
     missing = clarification = ""
     oil = ("масл" in q or "смазк" in q)
     broad = re.search(r"что (?:провер|уточн|делать)|чем опас|в ч[её]м причин|какие причин", q)
-    prev_oil = topic in {"oil", "oil-low", "oil-valve", "oil-measurement"}
+    prev_oil = topic.partition(":")[0] in {
+        "oil", "oil-low", "oil-valve", "oil-measurement", OIL_MEASUREMENT_TOPIC, YAMZ536_OIL_TOPIC,
+        ZMZ40904_OIL_TOPIC, ZMZ5234_OIL_KNOCK_TOPIC,
+    }
     # Учитываем диагноз для общего вопроса; явно названный узел задаёт новую тему.
     generic_words = ("что", "как", "где", "это", "этом", "чем", "чего", "при", "для", "мне", "машин",
                      "провер", "уточн", "делать", "водител", "двигател", "причин", "каки", "како",
                      "дальш", "опас", "риск", "сейча", "ещё", "еще", "сначал", "после", "диагност", "этой",
                      "отклонен", "выявлен", "подтвержден")
-    words = re.findall(r"[а-яё]{3,}", q)
+    words = re.findall(r"[а-яё]{3,}", re.sub(r"\bв первую очередь\b", "", q))
     contextual = broad and all(t.startswith(generic_words) for t in words)
     fault_name = (diagnosis.get("anomaly_title") or "").casefold() if diagnosis and diagnosis["status"] == "anomaly" else ""
     focus = q.replace(fault_name, " ").strip(" .!?:") if fault_name else q
-    use_ml_symptoms = bool(fault_name and (contextual or not focus or generic_diagnostic_question(focus)))
+    code = (diagnosis or {}).get("anomaly_type") if fault_name and diagnosis.get("signal_quality") != "bad" else None
+    pump_assessment = code == "F13" and asks_if_fuel_pump_needs_disassembly(q)
+    follows_fault = inspection_followup(code, q) or pump_assessment
+    use_ml_symptoms = bool(fault_name and (contextual or not focus or follows_fault or generic_diagnostic_question(focus)))
     asks_about_fault = bool(fault_name and (use_ml_symptoms or fault_name in q))
     primary = question
     if use_ml_symptoms:
         primary = "\n".join([question, diagnosis.get("anomaly_title") or "", diagnosis.get("description") or ""])
-    code = (diagnosis or {}).get("anomaly_type") if fault_name and diagnosis.get("signal_quality") != "bad" else None
     search = _Search(backend, engine, variant, primary, fault_code=code)
     inspection_missing = False
     needs_clarification = False
@@ -1417,16 +1582,92 @@ def retrieve(backend, engine, question, diagnosis=None, topic="", *, variant=Non
         missing, clarification, needs_clarification = _oil_thermovalve(search)
     elif select_oil_maintenance(search, q):
         topic = "oil-maintenance"
-    elif "клапан" in q and ("зазор" in q or "щуп" in q) and "редукцион" not in q:
+    elif (code == "F01" and (use_ml_symptoms or "клапан" in q and "зазор" in q and
+                                  re.search(r"провер|щуп", q) and "редукцион" not in q)
+          and (valve_result := select_valve_check(search)) is not None):
+        topic = VALVE_TOPIC
+        missing = valve_result
+    elif code == "F04" and (belt_result := select_belt_check(
+            search, q, diagnosis.get("description") or "", use_ml_symptoms, topic)) is not None:
+        topic = BELT_TOPIC
+        missing, clarification, needs_clarification = belt_result
+    elif (code == "F14" and engine == "ЗМЗ-40905.10" and diagnosis.get("session_id") == CHAIN_CHECK_ID
+          and (chain := select_chain_dialogue(search, q.removeprefix(fault_name + ". "),
+                                               diagnosis.get("description") or "", use_ml_symptoms, topic)) is not None):
+        topic, missing, clarification = chain
+    elif code in {"F09", "F12", "F14"} and (diagnostic_work := select_diagnostic_work(
+            search, code, q.removeprefix(fault_name + ". "), diagnosis.get("description") or "",
+            diagnostic=use_ml_symptoms, topic=topic)) is not None:
+        topic, missing = diagnostic_work
+    elif (code == "F06" and engine == "ЯМЗ-236М2" and diagnosis.get("session_id") == CLUTCH_CHECK_ID
+          and (clutch := select_yamz_clutch(search, q, diagnostic=use_ml_symptoms, topic=topic)) is not None):
+        topic, missing, clarification, needs_clarification = clutch
+    elif code in {"F05", "F06", "F14"} and (decision := clarify_diagnostic_basis(
+            search, code, q, diagnosis.get("description") or "", use_ml_symptoms, topic)) is not None:
+        topic, missing, clarification, needs_clarification = decision
+    elif code in {"F05", "F07"} and (component := select_generator_gearbox(
+            search, code, q, diagnosis.get("description") or "", topic=topic, diagnostic=use_ml_symptoms)) is not None:
+        topic, missing, clarification, needs_clarification = component
+    elif ((engine == "ЗМЗ-5234.10" and code == "F01" and use_ml_symptoms)
+          or ("клапан" in q and ("зазор" in q or "щуп" in q) and "редукцион" not in q)):
         topic = "valve-clearance"
-        search.passage("теплового зазора", r"Величина теплового зазора у впускного и выпускного"
-                       r".{1,500}?на холодном двигателе")
-        if not search.passage("торцом клапана", r"Вставив щуп в зазор.{1,950}?с усилием\."):
-            search.passage("торцом клапана", r"Вставив щуп в зазор между[^.]{10,600}?в пределах\s+"
-                           r"\d+[,\.]\d+\s*[-–—…]\s*\d+[,\.]\d+\s*мм\.")
+        if engine == "ЗМЗ-5234.10":
+            if not _zmz_5234_valve_clearance(search):
+                missing = "В найденных фрагментах нет процедуры проверки клапанных зазоров ЗМЗ-5234.10 с условиями и допуском."
+        else:
+            search.passage("теплового зазора", r"Величина теплового зазора у впускного и выпускного"
+                           r".{1,500}?на холодном двигателе")
+            if not search.passage("торцом клапана", r"Вставив щуп в зазор.{1,950}?с усилием\."):
+                search.passage("торцом клапана", r"Вставив щуп в зазор между[^.]{10,600}?в пределах\s+"
+                               r"\d+[,\.]\d+\s*[-–—…]\s*\d+[,\.]\d+\s*мм\.")
+    elif (code == "F02" and engine == "ЗМЗ-40904.10" and diagnosis.get("session_id") == ZMZ40904_CHECK_ID
+          and (measurement := select_zmz40904_oil_measurement(
+              search, q, topic, general=use_ml_symptoms and not asks_about_oil_indicator(engine, q),
+              asks_measurement=_asks_pressure_measurement(q, prev_oil) and not asks_about_oil_indicator(engine, q)
+          )) is not None):
+        topic, missing, clarification, needs_clarification = measurement
+    elif (code == "F02" and engine == "ЗМЗ-5234.10" and diagnosis.get("session_id") == ZMZ5234_CHECK_ID
+          and (oil_knock := select_zmz5234_oil_knock(
+              search, q, topic, general=use_ml_symptoms and not _asks_pressure_measurement(q, prev_oil),
+              warning_level=_pressure_warning_and_level, low_pressure=_low_pressure,
+          )) is not None):
+        topic, missing, clarification, needs_clarification = oil_knock
     elif "клапан" in q and ("редукцион" in q or "насос" in q or prev_oil and not re.search(r"впуск|выпуск|теплов|зазор", q)):
         topic = "oil-valve"
         _valve(search, q)
+    elif code == "F06" and (mounting := select_clutch_mounting(
+            search, q, (diagnosis.get("description") or "").casefold(), use_ml_symptoms)) is not None:
+        topic, missing, clarification, needs_clarification = mounting
+    elif code == "F06" and (clutch_decision := clarify_idle_clutch_noise(
+            search, q, diagnosis.get("description") or "", topic=topic, diagnostic=use_ml_symptoms)) is not None:
+        topic, missing, clarification, needs_clarification = clutch_decision
+    elif code == "F03" and (inspection := _overheating_inspection(
+            search, q, (diagnosis.get("description") or "").casefold() if use_ml_symptoms else "")) is not None:
+        topic = "cooling-inspection"
+        missing = inspection
+        if use_ml_symptoms:
+            clarification = "По одному коду F03 нельзя подтвердить попадание охлаждающей жидкости в масло."
+    elif code == "F10" and (inspection := select_compressor_drive(
+            search, q, (diagnosis.get("description") or "").casefold(), diagnostic=use_ml_symptoms)) is not None:
+        topic = "compressor-drive"
+        missing = inspection
+        if use_ml_symptoms:
+            clarification = "Уточните, одновременно ли давление перестало расти и увеличилось усилие на руле."
+    elif code == "F11" and (inspection := select_egr_inspection(search, q, use_ml_symptoms)) is not None:
+        topic = "egr-inspection"
+        missing = inspection
+    elif code == "F12" and (inspection := select_ignition_contacts(
+            search, q, diagnosis.get("description") or "", diagnostic=use_ml_symptoms)) is not None:
+        topic = "ignition-contacts"
+        missing = inspection
+    elif code == "F13" and follows_fault:
+        topic = "fuel-supply"
+        select_fault_evidence(search, diagnosis.get("description") or "", symptoms=True, fuel_checks_only=True)
+        if pump_assessment:
+            clarification = ("По исходным признакам основания для разборки бензонасоса не подтверждены. "
+                             "Если насос уже проверили, укажите результат проверки.")
+        if not search.evidence:
+            missing = "По указанным признакам в руководстве не удалось подтвердить порядок проверки подачи бензина."
     elif (torque := installation_torque(search, q)) is not None:
         topic = "installation-torque"
         missing = torque
@@ -1434,10 +1675,40 @@ def retrieve(backend, engine, question, diagnosis=None, topic="", *, variant=Non
         topic = "workshop-instruction"
     elif _disassembly(search, q):
         topic = "disassembly"
+    elif _asks_oil_pump_inspection(q):
+        topic = "oil-pump-inspection"
+        if not _oil_pump_inspection(search):
+            missing = "В найденных фрагментах нет способа проверить износ шестерён снятого масляного насоса."
+    elif code == "F02" and asks_about_oil_indicator(engine, q):
+        topic = "oil-indicator-test"
+        if not select_indexed_oil_indicator(search):
+            missing = "В руководстве не удалось подтвердить процедуру проверки указателя и его датчика."
+    elif (code == "F02" and engine == "ЯМЗ-236М2" and diagnosis.get("session_id") == OIL_CHECK_ID
+          and (measurement := select_oil_measurement(
+              search, q, topic, general=use_ml_symptoms, asks_measurement=_asks_pressure_measurement(q, prev_oil)
+          )) is not None):
+        topic, missing, clarification, needs_clarification = measurement
+    elif (code == "F02" and engine == "ЯМЗ-536" and diagnosis.get("session_id") == YAMZ536_CHECK_ID
+          and (measurement := select_yamz536_oil_measurement(
+              search, q, topic, general=use_ml_symptoms, asks_measurement=_asks_pressure_measurement(q, prev_oil)
+          )) is not None):
+        topic, missing, clarification, needs_clarification = measurement
     elif _asks_pressure_measurement(q, prev_oil):
         topic = "oil-measurement"
-        if not _pressure_measurement(search):
-            _generic(search, question, engine)
+        measured = _pressure_measurement(search)
+        if follows_fault and code == "F02" and "предупрежд" in q and (
+                engine == "ЯМЗ-236М2" or engine.startswith("ЗМЗ-")):
+            if engine == "ЯМЗ-236М2":
+                yamz236_low_pressure_evidence(search, legacy=True)
+            else:
+                _pressure_warning_and_level(search)
+            if not measured:
+                missing = "В найденных фрагментах не описан порядок контрольного замера давления масла на работающем двигателе."
+        elif not measured:
+            if engine == "ЯМЗ-536":
+                missing = _OIL_MEASUREMENT_MISSING
+            else:
+                _generic(search, question, engine)
     elif ("давлен" in q or prev_oil) and (oil or prev_oil) and re.search(r"норматив|номинальн|прогрет|прогре[вт]", q) or (
             "манометр" in q and re.search(r"прогрет|нагрет|номинальн", q) and re.search(r"норм|показан", q)):
         topic = "oil"
@@ -1458,12 +1729,22 @@ def retrieve(backend, engine, question, diagnosis=None, topic="", *, variant=Non
         topic = "oil-low"
         causes_only = bool(re.search(r"причин|почему|из-за чего", q) and
                            not re.search(r"провери|уточн|риск|опас|что делать", q))
-        _low_pressure(search, causes_only=causes_only)
-        if causes_only and not search.evidence:
-            missing = "В найденных разделах руководства причины пониженного давления масла не указаны."
-        if search.evidence and not causes_only:
-            clarification = ("Уточните у водителя показание прибора, единицы измерения, обороты, "
-                             "состояние аварийной лампы и был ли перегрев.")
+        if not causes_only and engine in ("ЯМЗ-236М2", "ЯМЗ-536"):
+            if engine == "ЯМЗ-236М2" and not yamz236_low_pressure_evidence(search, legacy=True):
+                missing = "В найденных фрагментах нет проверки соединений маслопроводов для этого двигателя."
+            elif engine == "ЯМЗ-536" and not _yamz_536_pressure_measurement(search):
+                missing = _OIL_MEASUREMENT_MISSING
+            clarification = ("Фактическое давление масла по сообщению ML определить нельзя. "
+                             "Уточните, горела ли аварийная лампа и на каких оборотах появился сигнал. "
+                             "Если давление измеряли, уточните показание и единицы.")
+        else:
+            _low_pressure(search, causes_only=causes_only)
+            if causes_only and not search.evidence:
+                missing = "В найденных разделах руководства причины пониженного давления масла не указаны."
+            if search.evidence and not causes_only:
+                clarification = ("Уточните у водителя, при каком режиме горела аварийная лампа, "
+                                 "какими были обороты и был ли перегрев. "
+                                 "Если давление измеряли, уточните показание и единицы.")
     elif ("термостат" in q and re.search(r"откры|пуска|срабатыв|без (?:него|термостата)", q)
           or topic == "thermostat" and re.fullmatch(r"(?:а\s+)?(?:можно (?:ли )?(?:ездить )?)?без него[?!. ]*", q.strip())):
         topic = "thermostat"
@@ -1488,6 +1769,17 @@ def retrieve(backend, engine, question, diagnosis=None, topic="", *, variant=Non
               and not re.match(r"(?:как|чем|сколько|где|како[йев])\b", q))):
         topic = "engine-knock"
         clarification, needs_clarification = _knock_dialog(search, q)
+    elif (code == "F08" and engine == "ЯМЗ-236М2"
+          and (use_ml_symptoms and "стук" in fault or re.search(r"\bпровер\w*\s+угол опережения впрыск", q))
+          and select_injection_timing(search, explain_cause=use_ml_symptoms)):
+        topic = "diesel-timing"
+    elif (code == "F08" and engine == "ЯМЗ-536"
+          and (use_ml_symptoms and "цилиндр" in fault and ("стук" in fault or "неравномер" in fault)
+               or re.search(r"\bтест форсунок(?:\s*№\s*10)?[?!. ]*$", q))
+          and select_injector_test(search)):
+        topic = "injector-test"
+    elif engine == "ЯМЗ-236М2" and select_yamz236_injector_reference(search, q):
+        topic = "injector-reference"
     elif (reviewed := _reviewed_procedure(search, q, procedures)) is not None:
         topic = "reviewed-procedure"
         missing = reviewed
@@ -1513,6 +1805,10 @@ def retrieve(backend, engine, question, diagnosis=None, topic="", *, variant=Non
             _conditional_instruction(search, q.strip())
             if not search.evidence:
                 _instruction_context(search, q.strip())
+            if not search.evidence and (reference := _short_component_reference(search, q)) is not None:
+                topic = "component-reference"
+                clarification = reference
+                needs_clarification = bool(reference)
     if not search.evidence and topic in {"oil", "oil-low", "oil-valve"} and not missing:
         _generic(search, question, engine)
     if not search.evidence and topic in {"oil", "oil-low", "oil-valve"} and not missing:
@@ -1531,4 +1827,5 @@ def retrieve(backend, engine, question, diagnosis=None, topic="", *, variant=Non
         asks_about_fault = bool(subject and subject <= fault_terms)
     return dict(topic=topic, queries=search.queries, evidence=search.evidence, missing=missing,
                 clarification=clarification, inspection_missing=inspection_missing, asks_about_fault=asks_about_fault,
-                needs_clarification=needs_clarification)
+                needs_clarification=needs_clarification,
+                manual_reference=topic in {"injector-reference", "component-reference", "oil-grade"})
