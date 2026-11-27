@@ -54,6 +54,70 @@ class ExpertSourcesTest(unittest.TestCase):
             row[self.headers.index(field)] = value
         return row
 
+    def test_confirmed_paraphrases_create_only_navigation_to_relevant_source(self):
+        row = self.edited(Выдержка="Манометром проверяют давление масла в канале.")
+        other = dict(self.chunk, id="другой источник", page_parts=[dict(page=2, text="Кожух и кронштейн генератора.")])
+        chunks, report = self.run_import([row, row], [self.chunk, other])
+        self.assertEqual(report["counts"], {"bound": 0, "review": 2, "not_found": 0})
+        self.assertEqual(report["navigation"]["routed_only"], 2)
+        self.assertEqual(report["navigation"]["available"], 2)
+        for item in report["rows"]:
+            self.assertEqual(item["routes"], [{"chunk_id": self.chunk["id"], "page": 2}])
+        route, = chunks[0]["fault_routes"]
+        self.assertEqual(route, {"code": "F02", "applicability": "ЯМЗ-536|all",
+                                 "source_pages": [2], "rows": [2, 3]})
+        self.assertNotIn("fault_bindings", chunks[0])
+        self.assertNotIn("fault_routes", chunks[1])
+        self.assertNotIn("fault_routes", self.chunk)
+
+    def test_rebuilding_drops_old_navigation_and_keeps_ineligible_rows_out(self):
+        restricted = dict(self.chunk, applicability=["ЯМЗ-536|А"], fault_routes=[{"code": "F03"}])
+        row = self.edited(Выдержка="Манометром проверяют давление масла в канале.")
+        tests = [self.row, self.edited(Исполнение="А", Статус="Не найдено"),
+                 self.edited(Исполнение="А", vehicle_id="неизвестная"),
+                 self.edited(Исполнение="А", Примечание="Не использовать как норматив"),
+                 self.edited(Исполнение="А", Документ="536.01.02 РК, 2014"), row]
+        chunks, report = self.run_import(tests, [restricted])
+        self.assertEqual(report["navigation"]["available"], 0)
+        self.assertNotIn("fault_routes", chunks[0])
+        self.assertTrue(all("routes" not in r for r in report["rows"]))
+
+    def test_a_bad_explicit_locator_or_disputed_number_does_not_become_navigation(self):
+        self.headers.append("Место в источнике")
+        row = self.edited(Выдержка="Проверить давление масла при температуре 120 °С.")
+        chunks, report = self.run_import([row + ["PDF 2: абзац «Измерить давление масла»"],
+                                          row + ["PDF 2: пункт 99"]])
+        self.assertEqual(report["counts"]["review"], 2)
+        self.assertEqual(report["navigation"]["available"], 0)
+        self.assertNotIn("fault_routes", chunks[0])
+
+    def test_navigation_can_offer_only_a_pdf_bookmark_without_scoped_text(self):
+        row = self.edited(Выдержка="Манометром проверяют давление масла в канале.")
+        chunks, report = self.run_import([row], [])
+        self.assertEqual(chunks, [])
+        self.assertEqual(report["navigation"]["reading_only"], 1)
+        self.assertEqual(report["rows"][0]["reading_reference"], {
+            "document_id": "yamz-536-rk-2013", "source_pages": [2], "applicability": "ЯМЗ-536|all"})
+        self.assertNotIn("chunk_id", report["rows"][0])
+        self.assertEqual(report["rows"][0]["result"], "review")
+
+    def test_navigation_does_not_substitute_a_range_for_a_missing_passage(self):
+        pages = [dict(self.page, page=i) for i in range(1, 10)]
+        self.registry[0]["page_count"] = len(pages)
+        row = self.edited(**{"Страницы PDF": "1–9", "Выдержка": "Давление масла проверяют манометром."})
+        chunks, report = self.run_import([row], [], pages)
+        self.assertEqual(report["navigation"]["available"], 0)
+        self.assertNotIn("reading_reference", report["rows"][0])
+
+    def test_navigation_does_not_confuse_tappets_and_chain_tensioners(self):
+        row = self.edited(Выдержка="При заедании гидротолкателя клапана заменить гидротолкатель.")
+        text = "При заедании гидронатяжителя привода клапанов заменить гидронатяжитель."
+        page = dict(self.page, text=text)
+        chunk = _chunk(page, "Клапанный механизм", ["ЯМЗ-536"], None, [dict(page=2,text=text)], "text")
+        chunks, report = self.run_import([row], [chunk], [page])
+        self.assertNotIn("fault_routes", chunks[0])
+        self.assertEqual(report["navigation"]["reading_only"], 1)
+
     def test_exact_binds_only_to_one_pair_and_keeps_source(self):
         chunks, report = self.run_import([self.row, self.row, self.edited(Статус="Не найдено")])
         self.assertEqual({"bound": 2, "review": 0, "not_found": 1}, report["counts"])

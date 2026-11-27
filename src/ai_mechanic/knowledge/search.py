@@ -8,6 +8,7 @@ import unicodedata
 
 from qdrant_client.http.exceptions import ApiException
 
+from .expert_answers import generic_diagnostic_question, select_fault_evidence
 from .figure_legends import select_figure_positions
 from .normative_tables import select_normative_rows
 from .oil_maintenance import select_oil_maintenance
@@ -44,7 +45,7 @@ def _clean(text):
 
 
 class _Search:
-    def __init__(self, backend, engine, variant, primary):
+    def __init__(self, backend, engine, variant, primary, fault_code=None):
         self.backend = backend
         self.engine = engine
         self.variant = variant
@@ -57,6 +58,14 @@ class _Search:
         elif re.search(r"руководств\w* по ремонту|\bпо РК\b", primary, re.I):
             self.manual_type = re.compile(r"ремонт|\bРК\b", re.I)
         self.primary = self._lookup(primary)
+        self.fault_hits = []
+        if fault_code and callable(getattr(type(backend), "search_fault", None)):
+            self.queries.append(f"{fault_code}: {primary}")
+            try:
+                hits = backend.search_fault(engine, primary, code=fault_code, variant=variant, limit=24)
+            except (ApiException, OSError, ValueError, RuntimeError) as exc:
+                raise SearchUnavailable("Поиск по экспертным ссылкам недоступен. Проверьте Qdrant.") from exc
+            self.fault_hits = [h for h in hits if not self.manual_type or self.manual_type.search(h.get("title", ""))]
 
     def _lookup(self, query):
         if query not in self.results:
@@ -74,7 +83,9 @@ class _Search:
         # Общий вопрос сохраняет контекст, отдельный запрос находит условия и шаги разных разделов.
         hits = []
         seen = set()
-        for hit in [*self._lookup(query), *self.primary]:
+        routed = {(h["document_id"], h["page"], h.get("id"), h["text"]): h for h in self.fault_hits}
+        for hit in [*self._lookup(query), *self.fault_hits, *self.primary]:
+            hit = routed.get((hit["document_id"], hit["page"], hit.get("id"), hit["text"]), hit)
             key = (hit["document_id"], hit["page"], hit.get("condition"), hit["text"])
             if key not in seen:
                 seen.add(key)
@@ -96,6 +107,9 @@ class _Search:
         parts = hit.get("page_parts") or [{"page": hit["page"], "text": hit["text"]}]
         for part in parts:
             source = dict(hit, page=part["page"], text=part["text"])
+            if part["page"] != hit["page"]:
+                source.pop("expert_rows", None)
+                source.pop("fault_code", None)
             self.add(source, part["text"], kind=kind, work=work)
 
     def passage(self, query, pattern, *, kind="fact", explain=None, work=None, lamp=False):
@@ -1333,11 +1347,14 @@ def retrieve(backend, engine, question, diagnosis=None, topic="", *, variant=Non
     words = re.findall(r"[а-яё]{3,}", q)
     contextual = broad and all(t.startswith(generic_words) for t in words)
     fault_name = (diagnosis.get("anomaly_title") or "").casefold() if diagnosis and diagnosis["status"] == "anomaly" else ""
-    asks_about_fault = bool(fault_name and (contextual or fault_name in q))
+    focus = q.replace(fault_name, " ").strip(" .!?:") if fault_name else q
+    use_ml_symptoms = bool(fault_name and (contextual or not focus or generic_diagnostic_question(focus)))
+    asks_about_fault = bool(fault_name and (use_ml_symptoms or fault_name in q))
     primary = question
-    if asks_about_fault:
+    if use_ml_symptoms:
         primary = "\n".join([question, diagnosis.get("anomaly_title") or "", diagnosis.get("description") or ""])
-    search = _Search(backend, engine, variant, primary)
+    code = (diagnosis or {}).get("anomaly_type") if fault_name and diagnosis.get("signal_quality") != "bad" else None
+    search = _Search(backend, engine, variant, primary, fault_code=code)
     inspection_missing = False
     needs_clarification = False
     codes = _diagram_codes(question)
@@ -1485,7 +1502,11 @@ def retrieve(backend, engine, question, diagnosis=None, topic="", *, variant=Non
         missing = norm
     else:
         topic = ""
-        _generic(search, question, engine)
+        if search.fault_hits:
+            terms = (diagnosis.get("description") or fault_name) if use_ml_symptoms else focus
+            select_fault_evidence(search, terms, symptoms=use_ml_symptoms)
+        if not search.evidence:
+            _generic(search, question, engine)
         if not search.evidence:
             missing = _compound_answer(search, q)
         if not (search.evidence or missing or asks_about_fault):

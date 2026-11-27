@@ -45,12 +45,14 @@ def _fingerprint(rows, signature):
 
 
 def replace_index(chunks, *, url=URL, collection=COLLECTION, client=None, encoder=None,
-                  cache_dir=CACHE, lock_dir="data/processed", batch_size=32):
+                  cache_dir=CACHE, lock_dir="data/processed", batch_size=32, catalog=()):
     """Публикует полную сборку одной заменой псевдонима. Предыдущая доступна до переключения."""
     rows = list(chunks)
     if not rows:
         raise ValueError("Пустой корпус. Действующая коллекция сохранена.")
-    if len({r["id"] for r in rows}) != len(rows):
+    catalog = list(catalog)
+    all_points = rows + catalog
+    if len({r["id"] for r in all_points}) != len(all_points):
         raise ValueError("В списке фрагментов есть повторяющиеся UUID.")
     if batch_size <= 0:
         raise ValueError("Размер пакета должен быть положительным.")
@@ -58,7 +60,7 @@ def replace_index(chunks, *, url=URL, collection=COLLECTION, client=None, encode
     client = client if client is not None else QdrantClient(url=url, timeout=90)
     try:
         encoder = encoder if encoder is not None else embeddings(Path(cache_dir).resolve())
-        digest = _fingerprint(rows, encoder.signature)
+        digest = _fingerprint(all_points, encoder.signature)
         lock_root = Path(lock_dir)
         lock_root.mkdir(parents=True, exist_ok=True)
         key = hashlib.sha256((url + "/" + collection).encode()).hexdigest()[:16]
@@ -67,13 +69,13 @@ def replace_index(chunks, *, url=URL, collection=COLLECTION, client=None, encode
                            if r.alias_name == collection), None)
             prefix = collection + "__"
             stem = prefix + digest + "_"
-            if active and active.startswith(stem) and client.count(active, exact=True).count == len(rows):
+            if active and active.startswith(stem) and client.count(active, exact=True).count == len(all_points):
                 return len(rows)
             if active is None and client.collection_exists(collection):
                 raise ValueError(f"Имя {collection} занято отдельной коллекцией. Укажите другое имя для сборки.")
             target = stem + uuid4().hex[:10]
             client.create_collection(
-                target, metadata={"encoder_signature": encoder.signature},
+                target, metadata={"encoder_signature": encoder.signature, "manual_chunks": len(rows), "catalog_groups": len(catalog)},
                 vectors_config={"dense": models.VectorParams(size=384, distance=models.Distance.COSINE)},
                 sparse_vectors_config={"bm25": models.SparseVectorParams(modifier=models.Modifier.IDF)},
                 hnsw_config=models.HnswConfigDiff(m=0, payload_m=0),
@@ -87,7 +89,10 @@ def replace_index(chunks, *, url=URL, collection=COLLECTION, client=None, encode
                     points = [models.PointStruct(id=row["id"], vector={"dense": dense, "bm25": sparse},
                                                  payload=row) for row, (dense, sparse) in zip(batch, vectors, strict=True)]
                     client.upsert(target, points=points, wait=True)
-                if client.count(target, exact=True).count != len(rows):
+                if catalog:
+                    client.upsert(target, points=[models.PointStruct(id=group["id"], vector={}, payload=group)
+                                                  for group in catalog], wait=True)
+                if client.count(target, exact=True).count != len(all_points):
                     raise ValueError("Число сохранённых фрагментов отличается от числа загруженных.")
                 operations = []
                 if active:
@@ -197,6 +202,58 @@ class QdrantSearch:
         result = self.client.query_points(physical, **args)
         return [dict(point.payload, score=point.score) for point in result.points]
 
+    @staticmethod
+    def _page_hit(chunk, part):
+        hit = dict(chunk, **part)
+        legacy_tables = chunk.get("tables", []) if len(chunk["source_pages"]) == 1 else []
+        hit["tables"] = part.get("tables", legacy_tables)
+        return hit
+
+    def search_fault(self, engine, query, *, code, variant=None, limit=16):
+        """Ищет по коду ML внутри разрешённых страниц и исполнений одного двигателя."""
+        if not engine or not query.strip() or code not in {f"F{i:02}" for i in range(1, 15)} or not 1 <= limit <= 100:
+            return []
+        pairs = [f"{engine}|all"]
+        if variant and variant != "all":
+            pairs.append(f"{engine}|{variant}")
+        pair_match = models.FieldCondition(key="applicability", match=models.MatchAny(any=pairs))
+        scoped = models.Filter(must=[
+            models.FieldCondition(key="code", match=models.MatchValue(value=code)), pair_match,
+        ])
+        fields = ("fault_bindings", "fault_routes")
+        allowed = models.Filter(must=[pair_match], should=[
+            models.NestedCondition(nested=models.Nested(key=field, filter=scoped)) for field in fields
+        ])
+        encoder = self._encoder if self._encoder is not None else embeddings(self.cache_dir)
+        physical = self._physical_collection(encoder.signature)
+        hits = []
+        for chunk in self._ranked_chunks(physical, encoder, query, allowed, limit):
+            references = [ref for field in fields for ref in chunk.get(field, ())
+                          if ref["code"] == code and ref["applicability"] in pairs]
+            for part in chunk["page_parts"]:
+                rows = sorted({row for ref in references if part["page"] in ref["source_pages"] for row in ref["rows"]})
+                if rows:
+                    hit = self._page_hit(chunk, part)
+                    hit.update(fault_code=code, expert_rows=rows)
+                    hits.append(hit)
+        return hits
+
+    def reference_entries(self, engine, code, *, variant=None):
+        """Читает указатель по строкам выбранной пары из той же коллекции, что и поиск."""
+        from .expert_catalog import catalog_id
+        pairs = {engine + "|all"}
+        if variant:
+            pairs.add(engine + "|" + variant)
+        points = self.client.retrieve(self.collection, ids=[catalog_id(code, pair) for pair in sorted(pairs)],
+                                      with_payload=True, with_vectors=False)
+        entries = []
+        for point in points:
+            group = point.payload
+            if (group and group.get("kind") == "expert_catalog" and group.get("code") == code
+                    and pairs.intersection(group.get("applicability", ()))):
+                entries.extend(group["entries"])
+        return sorted(entries, key=lambda entry: entry["row"])
+
     def search_vehicle(self, vehicle, query, *, variant=None, limit=12):
         """Ищет по модели двигателя из карточки и подтверждённому исполнению."""
         if not vehicle.get("engine_model"):
@@ -207,8 +264,6 @@ class QdrantSearch:
         hits = []
         for chunk in self.search_chunks(engine, query, variant=variant, limit=limit):
             for part in chunk["page_parts"]:
-                hit = dict(chunk, **part)
-                hit["tables"] = part.get("tables", chunk.get("tables", []) if len(chunk["source_pages"]) == 1 else [])
-                hits.append(hit)
+                hits.append(self._page_hit(chunk, part))
         return hits
 

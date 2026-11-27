@@ -163,7 +163,8 @@ class Workshop:
         else:
             reply = session.ask(machine_id, question, check_id=check_id, diagnosis=diagnostic)
 
-        for source in reply["sources"]:
+        reading_pages = [source for entry in reply.get("reading_references", []) for source in entry["sources"]]
+        for source in [*reply["sources"], *reading_pages]:
             base = _manual_url(source["document_id"])
             page = source["page"]
             source["url"] = f"{base}.pdf#page={page}"

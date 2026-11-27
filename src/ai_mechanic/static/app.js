@@ -223,6 +223,14 @@ function render(reply, isDiagnostic) {
     sources.forEach((source, i) => refs.append(link(source, "[" + (i + 1) + "] " + sourceCaption(source))));
     card.append(refs);
   }
+  const labels = {bound: "Проверенная выдержка", route: "Тематический фрагмент", reading: "Страницы для сверки"};
+  for (const entry of reply.reading_references ?? []) {
+    const details = node("details", "", "refs");
+    details.append(node("summary", (entry.section || "Руководство") + " · строка " + entry.row));
+    details.append(node("strong", labels[entry.level]));
+    for (const source of entry.sources) details.append(link(source, sourceCaption(source)));
+    card.append(details);
+  }
   for (const warning of reply.warnings ?? []) card.append(node("p", warning, "warning"));
   log.append(card);
   log.scrollTop = card.offsetTop - log.offsetTop;

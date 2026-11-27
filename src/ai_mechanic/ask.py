@@ -3,11 +3,14 @@
 import argparse
 import json
 import webbrowser
+
+from qdrant_client.http.exceptions import ApiException
 from pathlib import Path
 import sys
 
 from .knowledge.search import SearchUnavailable, add_search_arguments, configured_search, retrieve
 from .knowledge.sources import SourceUnavailable, resolve_source
+from .knowledge.expert_catalog import requests_references
 
 
 def _records(path, key=None):
@@ -93,6 +96,35 @@ class ManualSession:
         self.selection = None
         self.topic = ""
 
+    def _reading_references(self, reply, backend, engine, variant, code):
+        seen = {}
+        rows = []
+        try:
+            entries = backend.reference_entries(engine, code, variant=variant)
+        except (ApiException, OSError) as exc:
+            raise SearchUnavailable("Не удалось открыть указатель источников. Проверьте соединение с Qdrant.") from exc
+        for entry in entries:
+            if not _applies(entry, engine, variant):
+                continue
+            sources = []
+            try:
+                for page in entry["source_pages"]:
+                    key = (entry["document_id"], entry["source_sha256"], page)
+                    if key not in seen:
+                        seen[key] = resolve_source(dict(entry, page=page), self.registry, self.root)
+                    sources.append(dict(seen[key]))
+            except SourceUnavailable as exc:
+                if str(exc) not in reply["warnings"]:
+                    reply["warnings"].append(str(exc))
+                continue
+            if sources:
+                rows.append(dict(row=entry["row"], section=entry["section"], level=entry["level"],
+                                 sources=sources))
+        reply["reading_references"] = rows
+        reply["text"] = (f"Источники для {code}, {engine}. Строк в указателе: {len(rows)}."
+                         if rows else f"Для {code} и {engine} в этом индексе нет доступных ссылок.")
+        return reply
+
     def _find_machine(self, machine_id):
         return next((item for item in self.machines if item["vehicle_id"] == machine_id), None)
 
@@ -153,6 +185,13 @@ class ManualSession:
             reply["text"] = "\n\n".join(lines)
             return reply
 
+        if requests_references(question):
+            if not anomaly:
+                reply["text"] = ("Сначала получите результат диагностики для выбранной проверки."
+                                 if diagnosis is None else "По этой проверке ML не выявил отклонения.")
+                return reply
+            backend = self.search if self.search is not None else configured_search()
+            return self._reading_references(reply, backend, engine, variant, diagnosis["anomaly_type"])
         backend = self.search if self.search is not None else configured_search()
         result = self.retrieve(backend, engine, question, diagnosis=diagnosis, topic=self.topic,
                                variant=variant, procedures=self.procedures)
@@ -176,6 +215,10 @@ class ManualSession:
             if key not in numbers:
                 reply["sources"].append(source)
                 numbers[key] = len(reply["sources"])
+            if item.get("expert_rows"):
+                reference = reply["sources"][numbers[key] - 1]
+                reference["fault_code"] = item["fault_code"]
+                reference["expert_rows"] = sorted(set(reference.get("expert_rows", ())) | set(item["expert_rows"]))
             if item.get("work") or item.get("lamp"):
                 reply["inspection_steps"].append(dict(document_id=key[0], page=key[1],
                                                       role="lamp" if item.get("lamp") else "work",
@@ -214,6 +257,10 @@ def _print_reply(reply, trace):
     print(reply["text"])
     for i, source in enumerate(reply["sources"], 1):
         print(f"[{i}] {source['title']}, {source['edition']}, PDF стр. {source['page']}\n    {source['url']}")
+    for entry in reply.get("reading_references", []):
+        print(f"Строка {entry['row']}. {entry['section']}")
+        for source in entry["sources"]:
+            print(f"    {source['title']}, PDF {source['page']}: {source['url']}")
     for warning in reply["warnings"]:
         print(warning, file=sys.stderr)
     if trace:

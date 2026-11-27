@@ -93,8 +93,8 @@ docker run -d --name mechanic-hackathon-qdrant --publish 127.0.0.1:6335:6333 --m
 Положите экспертную таблицу в `data/annotations/defect_sources.xlsx`. После извлечения всех PDF соберите отдельного кандидата. Запустите заглушку ML для проверки диалога.
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 -m ai_mechanic.knowledge.qdrant_index build --url http://127.0.0.1:6335 --collection mechanic_hackathon_candidate --expert-sources data/annotations/defect_sources.xlsx
-.\.venv\Scripts\python.exe -X utf8 tests/check_e5_pilot.py --qdrant-url http://127.0.0.1:6335 --collection mechanic_hackathon_candidate --cases tests/fixtures/check_search_candidate.json --output data/processed/search_quality_candidate.json
+.\.venv\Scripts\python.exe -X utf8 -m ai_mechanic.knowledge.qdrant_index build --url http://127.0.0.1:6335 --collection mechanic_hackathon_expert_chat --expert-sources data/annotations/defect_sources.xlsx --expert-report data/processed/expert_sources_chat_report.json
+.\.venv\Scripts\python.exe -X utf8 tests/check_e5_pilot.py --qdrant-url http://127.0.0.1:6335 --collection mechanic_hackathon_expert_chat --cases tests/fixtures/check_search_candidate.json --output data/processed/search_quality_expert_chat.json
 ```
 
 В `Выдержке` можно сохранить дословный текст или проверенный пересказ. Для пересказа укажите физические страницы в `Страницы PDF` и номер пункта в `Раздел`. Если этого недостаточно, добавьте необязательную колонку `Место в источнике`. Примеры:
@@ -105,7 +105,11 @@ docker run -d --name mechanic-hackathon-qdrant --publish 127.0.0.1:6335:6333 --m
 
 Замените номера и названия на указанные в вашем PDF. Если факты относятся к разным шагам или ячейкам, укажите их отдельными строками. Колонка `Исполнение` необязательна. Для инструкции, которая зависит от исполнения, укажите подтверждённое исполнение по разметке PDF.
 
-В отчёте `data/processed/expert_sources_report.json` указаны способ привязки и физические страницы. Для спорных строк отчёт по возможности показывает до трёх фрагментов для проверки. Метка F01–F14 связывается с исходным текстом PDF. В `search_quality_candidate.json` проверьте выдачу, факты в ответе и открытие страниц по всем шести руководствам.
+В Qdrant хранятся текст руководств и указатель по коду неисправности и двигателю. Параметр `--expert-sources` включает импорт Excel при сборке. После правки таблицы повторите сборку. В `data/processed/expert_sources_chat_report.json` у каждой строки указаны результат и физические страницы PDF.
+
+Чтобы проверить ссылки всех доступных строк через веб-чат, запустите `.\.venv\Scripts\python.exe -X utf8 tests/check_expert_catalog.py`. Скрипт использует работающие Qdrant и заглушку ML. Результат появится в `data/processed/expert_chat_coverage.json`.
+
+После диагностики спросите в чате «Покажи источники по этой неисправности». У каждой ссылки видно, сверена ли выдержка, найден ли тематический фрагмент или указана только страница для чтения. Технические рекомендации чат берёт из применимого текста руководства. Страница для чтения сама по себе не даёт основания добавить работу в заявку.
 
 ## Запуск веб-чата
 
@@ -126,15 +130,15 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m uvicorn mock_toir.app:app --host 127.0.0.1 --port 8002
 ```
 
-В третьем терминале из корня проекта запустите чат. Для пробной коллекции используйте команду ниже. Когда полный индекс будет готов, укажите `--collection mechanic_hackathon`.
+В третьем терминале из корня проекта запустите чат с индексом шести руководств.
 
 ```powershell
 $env:MOCK_ML_URL = 'http://127.0.0.1:8001'
 $env:MOCK_TOIR_URL = 'http://127.0.0.1:8002'
-.\.venv\Scripts\python.exe -X utf8 -m ai_mechanic.web --qdrant-url http://127.0.0.1:6335 --collection mechanic_hackathon_smoke
+.\.venv\Scripts\python.exe -X utf8 -m ai_mechanic.web --qdrant-url http://127.0.0.1:6335 --collection mechanic_hackathon_expert_chat
 ```
 
-Откройте [чат](http://127.0.0.1:8765/). Для пробной коллекции выберите машину `H275AA47` и проверку `S-0139`. Нажмите «Получить диагностику», откройте ссылку на руководство и просмотрите заявку. При необходимости отредактируйте её и подтвердите отправку. Номер появится в чате и истории машины. Черновики и отправленные заявки хранятся в `data/state/work_orders.sqlite`.
+Откройте [чат](http://127.0.0.1:8765/). Выберите машину `H275AA47` и проверку `S-0139`. Нажмите «Получить диагностику», откройте ссылку на руководство и просмотрите заявку. При необходимости отредактируйте её и подтвердите отправку. Номер появится в чате и истории машины. Черновики и отправленные заявки хранятся в `data/state/work_orders.sqlite`.
 
 Чтобы проверить ответ по руководству отдельно, спросите «Какое моторное масло использовать в двигателе?». Откроется ссылка на физическую страницу 9 PDF.
 

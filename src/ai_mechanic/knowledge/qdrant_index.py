@@ -36,7 +36,7 @@ def _write_report(path, report):
 
 
 def load_chunks(pages_path, notes_path, registry_path, *, documents=(), expert_sources=None,
-                expert_report=None, vehicles="data/raw/vehicles.json", fault_types="data/raw/fault_types.json"):
+                expert_report=None, vehicles="data/raw/vehicles.json", fault_types="data/raw/fault_types.json", catalog=None):
     """Сверяет PDF с реестром и выгрузкой перед формированием фрагментов."""
     if expert_sources is not None:
         paths = dict(pages=pages_path, notes=notes_path, registry=registry_path,
@@ -122,6 +122,9 @@ def load_chunks(pages_path, notes_path, registry_path, *, documents=(), expert_s
                 "indexed_pages": sorted({n for chunk in matching for n in chunk["source_pages"]}),
                 "chunks": len(matching),
             }
+        if catalog is not None:
+            from .expert_catalog import catalog_records
+            catalog.extend(catalog_records(report, registry))
         _write_report(destination, report)
     return chunks
 
@@ -167,13 +170,18 @@ def _run(args):
             raise ValueError("Для пробной сборки укажите отдельный псевдоним через --collection.")
         if args.page and (len(args.document or ()) != 1 or min(args.page) < 1):
             raise ValueError("Для --page укажите одно руководство через --document и страницы от 1.")
+        catalog = []
         chunks = load_chunks(args.pages, args.notes, args.registry, documents=args.document or (),
                              expert_sources=args.expert_sources, expert_report=args.expert_report,
-                             fault_types=args.fault_types, vehicles=args.vehicles)
+                             fault_types=args.fault_types, vehicles=args.vehicles, catalog=catalog)
         if args.page:
             selected = set(args.page)
             chunks = [chunk for chunk in chunks if selected.intersection(chunk["source_pages"])]
-        total = replace_index(chunks, url=args.url, collection=args.collection)
+            for group in catalog:
+                group["entries"] = [dict(row, source_pages=[p for p in row["source_pages"] if p in selected])
+                                    for row in group["entries"] if selected.intersection(row["source_pages"])]
+            catalog = [group for group in catalog if group["entries"]]
+        total = replace_index(chunks, url=args.url, collection=args.collection, catalog=catalog)
         print(f"Сохранено фрагментов: {total}. Псевдоним: {args.collection}.")
         return 0
 

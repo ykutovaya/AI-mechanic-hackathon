@@ -44,6 +44,24 @@ class QdrantStorageTests(unittest.TestCase):
         return self.store.replace_index(rows, client=self.client, collection="manuals",
                                         encoder=self.encoder, lock_dir=self.directory)
 
+    def test_fault_catalog_tracks_collection_version_without_scoring_directory_points(self):
+        payload = {"row": 27, "source_pages": [5], "section": "Раздел", "level": "reading"}
+        def build(page):
+            from ai_mechanic.knowledge.expert_catalog import catalog_id
+            directory = {"id": catalog_id("F02", "Д|all"), "kind": "expert_catalog",
+                         "code": "F02", "applicability": ["Д|all"],
+                         "entries": [dict(payload, source_pages=[page])]}
+            return self.store.replace_index(self.rows, catalog=[directory], client=self.client,
+                collection="manuals", encoder=self.encoder, lock_dir=self.directory)
+        self.assertEqual(build(5), len(self.rows))
+        search = self.store.QdrantSearch(client=self.client, collection="manuals", encoder=self.encoder)
+        self.assertEqual(search.reference_entries("Д", "F02")[0]["source_pages"], [5])
+        self.assertEqual(search.reference_entries("Д", "F01"), [])
+        self.assertEqual(search.reference_entries("Е", "F02"), [])
+        self.assertTrue(all("page_parts" in h for h in search.search_chunks("Д", "Давление")))
+        build(6)
+        self.assertEqual(search.reference_entries("Д", "F02")[0]["source_pages"], [6])
+
     def test_search_and_builder_share_default_alias(self):
         from unittest.mock import patch
         from ai_mechanic.knowledge import qdrant_index

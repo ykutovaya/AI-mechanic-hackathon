@@ -185,6 +185,78 @@ def _new_scoped_chunk(page, parts, engine, variant):
     return _chunk(page, page["section"], [engine], [engine + "|all"], parts, "text")
 
 
+class _UnscopedQuote(ValueError):
+    """Цитата есть в PDF, но её область применимости не проверена."""
+
+
+def _navigation(row, detail, eligible, possible, pair, doc):
+    """Добавляет указатель для поиска. Проверенным основанием остаётся только fault_bindings."""
+    words = _topic_words(row["Выдержка"])
+    if not words:
+        return
+    numbers = set(detail["requested_pages"])
+    if len(numbers) > 1 and len(numbers) == doc["page_count"]:
+        return
+    # В короткой выдержке нужны до трёх значимых терминов, в длинной — не менее трети
+    # (до семи). Так слова «клапан» и «заменить» не уводят к другому узлу.
+    minimum = max(2, min(3, len(words)), min(7, (len(words) + 2) // 3))
+    ranked = []
+    for chunk in eligible:
+        for part in chunk["page_parts"]:
+            if part["page"] not in numbers:
+                continue
+            text = _topic_words(part["text"])
+            overlap = words & text
+            if len(overlap) >= minimum:
+                ranked.append((-len(overlap), len(text), part["page"], chunk["id"], chunk))
+    seen = set()
+    best = -min((item[0] for item in ranked), default=0)
+    for score, _, number, key, chunk in sorted(ranked, key=lambda hit: hit[:4]):
+        if -score * 3 < best * 2:
+            break
+        if (number, key) in seen:
+            continue
+        seen.add((number, key))
+        routes = chunk.setdefault("fault_routes", [])
+        same = next((r for r in routes if r["code"] == detail["code"] and
+                     r["applicability"] == pair and r["source_pages"] == [number]), None)
+        if same is None:
+            same = {"code": detail["code"], "applicability": pair, "source_pages": [number], "rows": []}
+            routes.append(same)
+        same["rows"].append(detail["row"])
+        detail.setdefault("routes", []).append({"chunk_id": key, "page": number})
+        if len(seen) == 3:
+            return
+    # Короткая ссылка эксперта разрешает открыть PDF вручную. Страница другого
+    # исполнения или непроверенный OCR никогда не добавляются в доказательства чата.
+    if seen or len(numbers) > 6:
+        return
+    eligible_pages = {n for c in eligible for n in c["source_pages"]}
+    scoped_pages = {n for c in possible.values() for n in c["source_pages"]}
+    if numbers & (scoped_pages - eligible_pages):
+        return
+    detail["reading_reference"] = {"document_id": doc["document_id"], "source_pages": sorted(numbers),
+                                   "applicability": pair}
+
+
+@lru_cache(maxsize=8192)
+def _topic_words(text):
+    """Убирает частые слова инструкций перед выбором фрагмента как подсказки для поиска."""
+    words = re.findall(r"[а-яё]{4,}", _label(text))
+    common = ("двигат", "возмож", "руковод", "соответ", "провери", "проверк", "следуе",
+              "провес", "устано", "неиспр", "устран", "деталь", "детали", "долж", "рекоме",
+              "котор", "систем", "раздел", "таблиц", "указан", "работ", "после", "также",
+              "необхо", "страни", "этого", "други", "данно", "налич", "замен", "произве",
+              "состоян", "провер", "измерит", "значени", "устрани", "помощ", "выполн")
+    result = set()
+    for word in words:
+        if word.startswith(common):
+            continue
+        stem = re.sub(r"(?:иями|ями|ами|ого|его|ому|ему|ой|ей|ые|ие|ую|юю|ая|яя|ых|их|ою|ом|ем|ам|ям|ах|ях|ов|ев|ия|ию|ий|ии|а|я|е|о|и|ы|у|ю|ь)$", "", word)
+        result.add((stem if len(stem) >= 4 else word)[:11])
+    return frozenset(result)
+
+
 def _load(path):
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
@@ -196,7 +268,7 @@ def apply_expert_sources(chunks, *, workbook, registry, fault_types, vehicles, p
     codes = {item["code"]: item["title"] for item in _load(fault_types)}
     cards = {item["vehicle_id"]: item["engine_model"] for item in _load(vehicles)["vehicles"]}
     by_page = defaultdict(list)
-    output = {chunk["id"]: {k:v for k,v in chunk.items() if k != "fault_bindings"} for chunk in chunks}
+    output = {chunk["id"]: {k:v for k,v in chunk.items() if k not in ("fault_bindings", "fault_routes")} for chunk in chunks}
     for chunk in output.values():
         for number in chunk["source_pages"]:
             by_page[chunk["document_id"], number].append(chunk)
@@ -239,6 +311,11 @@ def apply_expert_sources(chunks, *, workbook, registry, fault_types, vehicles, p
             report["rows"].append(detail)
     finally:
         book.close()
+    routed = sum(bool(row.get("routes")) for row in report["rows"])
+    reading = sum(bool(row.get("reading_reference")) for row in report["rows"])
+    available = counts["bound"] + routed + reading
+    report["navigation"] = {"bound": counts["bound"], "routed_only": routed, "reading_only": reading,
+                            "unavailable": len(report["rows"]) - available, "available": available}
     return list(output.values()), report
 
 
@@ -290,6 +367,7 @@ def _bind(row, detail, registry, codes, cards, raw_pages, by_page, output):
                 matched = list(labelled_row_locations(eligible, numbers, excerpt,
                                                       lambda text: [word[0] for word in _tokens(text)[1]]))
                 if not matched:
+                    _navigation(row, detail, eligible, possible, pair, doc)
                     raise ValueError("Укажите место в источнике для пересказа в колонке «Раздел» или «Место в источнике»")
             if len(matched) != 1:
                 raise ValueError("Найдено несколько мест в PDF. Уточните страницу, пункт или строку таблицы")
@@ -298,7 +376,9 @@ def _bind(row, detail, registry, codes, cards, raw_pages, by_page, output):
             parts = [part]
         else:
             chunk, parts = found
-    except ValueError:
+    except ValueError as exc:
+        if isinstance(exc, _UnscopedQuote) and not explicit:
+            _navigation(row, detail, eligible, possible, pair, doc)
         detail["candidates"] = candidates(eligible, numbers, detail["section"], excerpt, matched)
         raise
     detail["match_method"] = method
@@ -345,7 +425,7 @@ def _exact(eligible, pages, raw_pages, doc_id, numbers, engine, variant, excerpt
         parts = raw[0]
         chunk = _new_scoped_chunk(raw_pages[doc_id, parts[0]["page"]], parts, engine, variant)
         if not chunk:
-            raise ValueError("Текст найден, но подтверждённого фрагмента с этой применимостью нет")
+            raise _UnscopedQuote("Текст найден, но подтверждённого фрагмента с этой применимостью нет")
         chunk = output.setdefault(chunk["id"], chunk)
     else:
         return None

@@ -199,6 +199,11 @@ class RecordingSearch(QdrantSearch):
         super().__init__(*args, **kwargs)
         self.lookups = []
 
+    def search_fault(self, engine, query, *, code, variant=None, limit=12):
+        hits = super().search_fault(engine, query, code=code, variant=variant, limit=limit)
+        self.lookups.append((f"{code}: {query}", hits))
+        return hits
+
     def search(self, engine, query, *, variant=None, limit=12):
         hits = super().search(engine, query, variant=variant, limit=limit)
         self.lookups.append((query, hits))
@@ -324,14 +329,15 @@ def evaluate(options):
         physical = _physical(backend, options.collection)
         backend.collection = physical
         metadata = backend.client.get_collection(physical).config.metadata or {}
-        count = backend.client.count(physical, exact=True).count
+        point_count = backend.client.count(physical, exact=True).count
+        count = metadata.get("manual_chunks", point_count)
         if not count:
             raise ValueError(f"Коллекция {physical} пуста.")
         with chat_server(backend, options.data, options.ml_url, excerpts) as server:
             validate_cases(cases, server.workshop.machines)
             rows = [_evaluate_case(case, server, backend, excerpts, verified)
                     for case in cases]
-        if physical != _physical(backend, options.collection) or count != backend.client.count(physical, exact=True).count:
+        if physical != _physical(backend, options.collection) or point_count != backend.client.count(physical, exact=True).count:
             raise ValueError("Во время прогона изменилась коллекция. Повторите проверку.")
     code = sorted(Path("src/ai_mechanic/knowledge").glob("*.py"))
     code.extend(Path("src/ai_mechanic") / name for name in ("ask.py", "web.py"))
