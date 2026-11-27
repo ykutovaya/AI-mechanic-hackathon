@@ -1,4 +1,4 @@
-"""Формирует дополнительные запросы для первичного осмотра и проверки типа топливной аппаратуры."""
+"""Формирует дополнительные запросы по вопросу механика и найденным причинам."""
 
 import re
 
@@ -18,6 +18,10 @@ def mentions_pressure_drop(text):
 def followup_queries(question):
     """Дополняет широкий вопрос поиском по отдельным темам в том же руководстве."""
     q = question.casefold().replace("ё", "е")
+    disassembly = re.match(r"\s*(?:(?:подскажите,?\s*)?как\s+(?:правильно\s+)?)?"
+                          r"(?:разобрать|разбирать)\s+([^?!.\n]{3,100})(?:[?!.\n]|$)", q)
+    if disassembly:
+        return ("Разборка " + disassembly[1].strip(),)
     if (re.search(r"вспышк|диагностическ\w*\s+кнопк", q)
             and re.search(r"топлив|тнвд", q) and re.search(r"\bкод\w*\b", q)):
         return (FUEL_SYSTEM,)
@@ -28,4 +32,14 @@ def followup_queries(question):
             oil = re.search(r"\b(?:давлени\w*|напор\w*)\s+(?:моторного\s+)?масла\b|\bсистем\w*\s+смазки\b", clause)
             if oil and mentions_pressure_drop(clause) and not re.search(r"\bне\s+(?:понижен|низк|упал|пада|снизи)", clause):
                 return (OIL_SIGNAL, OIL_LEVEL, OIL_CAUSES)
+    return ()
+
+def pump_inspection_queries(cause_hits):
+    """Ищет проверку деталей, когда руководство прямо связывает падение давления с износом насоса."""
+    wear = r"\bизнос\w*\s+(?:шестер[её]н\w*|детал\w*)[^.!?;|]{0,80}\bмаслян\w*\s+насос\w*"
+    for hit in cause_hits:
+        text = " ".join(hit.get("text", "").split())
+        if re.search(wear, text, re.I):
+            return ("Проверка износа деталей масляного насоса при снижении давления масла",
+                    "Масляный насос. Проверка деталей на износ")
     return ()

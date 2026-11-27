@@ -1,0 +1,234 @@
+"""Приёмка связей экспертной таблицы с источником."""
+
+import importlib.util
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from openpyxl import Workbook
+
+from ai_mechanic.knowledge.qdrant_chunks import _chunk
+
+
+class ExpertSourcesTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        self.workbook = self.directory / "expert.xlsx"
+        self.codes = self.directory / "faults.json"
+        self.codes.write_text(json.dumps([{"code": "F02", "title": "Давление масла"}]))
+        self.vehicles = self.directory / "vehicles.json"
+        self.vehicles.write_text(json.dumps({"vehicles": [{"vehicle_id": "A1", "engine_model": "ЯМЗ-536"}]}))
+        self.registry = [{"document_id": "yamz-536-rk-2013", "title": "536.01.02 РК",
+                          "edition": "2013", "path": "manual.pdf", "engine_models": ["ЯМЗ-536"],
+                          "source_sha256": "a" * 64, "page_count": 3}]
+        self.source = "Измерить давление масла в канале двигателя при температуре 80 °С."
+        self.page = dict(self.registry[0], page=2, text=self.source, section="Проверка")
+        self.chunk = _chunk(self.page, "Проверка", ["ЯМЗ-536"], None,
+                            [dict(page=2, text=self.source)], "text")
+        self.headers = ["Код", "Название неисправности", "vehicle_id", "Модель двигателя", "Исполнение",
+                        "Документ", "Страницы PDF", "Выдержка", "Статус", "Примечание"]
+        self.row = ["F02", "Давление масла", "A1", "ЯМЗ-536", "", "536.01.02 РК, 2013",
+                    "PDF 2", self.source, "Подтверждено", ""]
+
+    def run_import(self, rows, chunks=None, pages=None):
+        book = Workbook()
+        book.active.append(self.headers)
+        for row in rows:
+            book.active.append(row)
+        book.save(self.workbook)
+        book.close()
+        name = "ai_mechanic.knowledge.expert_sources"
+        self.assertIsNotNone(importlib.util.find_spec(name), "Импорт подтвержденных выдержек отсутствует")
+        from ai_mechanic.knowledge.expert_sources import apply_expert_sources
+
+        return apply_expert_sources([self.chunk] if chunks is None else chunks, workbook=self.workbook,
+                                    registry=self.registry, fault_types=self.codes, vehicles=self.vehicles,
+                                    pages={"yamz-536-rk-2013": [self.page] if pages is None else pages})
+
+    def edited(self, **fields):
+        row = list(self.row)
+        for field, value in fields.items():
+            row[self.headers.index(field)] = value
+        return row
+
+    def test_exact_binds_only_to_one_pair_and_keeps_source(self):
+        chunks, report = self.run_import([self.row, self.row, self.edited(Статус="Не найдено")])
+        self.assertEqual({"bound": 2, "review": 0, "not_found": 1}, report["counts"])
+        self.assertEqual([2, 3], chunks[0]["fault_bindings"][0]["rows"])
+        self.assertEqual("ЯМЗ-536|all", chunks[0]["fault_bindings"][0]["applicability"])
+        self.assertEqual(self.chunk["text"], chunks[0]["text"])
+        self.assertNotIn("fault_bindings", self.chunk)
+        self.assertEqual("not_found", report["rows"][-1]["result"])
+
+    def test_rejects_unverified_rows_and_never_uses_partial_matches(self):
+        cases = [{"Код": ""}, {"Код": "F99"}, {"Модель двигателя": "ЯМЗ-236М2"},
+                 {"vehicle_id": "другая"}, {"Документ": "536.01.02 РК, 2015"},
+                 {"Страницы PDF": "~2"}, {"Страницы PDF": "PDF 2, 4"},
+                 {"Статус": "Требует сверки"}, {"Выдержка": self.source + " Давление выше нормы."},
+                 {"Примечание": "Противоречие внутри издания по значению норматива."},
+                 {"Страницы PDF": "2", "Выдержка": self.source.replace("80", "8,0")}]
+        chunks, report = self.run_import([self.edited(**case) for case in cases])
+        self.assertEqual(len(cases), report["counts"]["review"])
+        self.assertNotIn("fault_bindings", chunks[0])
+
+    def test_duplicate_locations_and_variant_only_attachment(self):
+        repeated = dict(self.chunk, id="другой", section="Второе место")
+        _, report = self.run_import([self.row], [self.chunk, repeated])
+        self.assertEqual(1, report["counts"]["review"])
+        restricted = dict(self.chunk, applicability=["ЯМЗ-536|А"])
+        _, report = self.run_import([self.row], [restricted])
+        self.assertEqual(1, report["counts"]["review"])
+        chunks, report = self.run_import([self.edited(Исполнение="А")], [restricted])
+        self.assertEqual("ЯМЗ-536|А", chunks[0]["fault_bindings"][0]["applicability"])
+
+    def test_new_passage_requires_explicit_scope_without_sharing_applicability(self):
+        quote = "На двигателе ЯМЗ-536 проверить состояние корпуса насоса и его креплений."
+        page = dict(self.page, text=quote + "\nНа двигателе ЯМЗ-536-10 используется другой порядок.")
+        chunks, report = self.run_import([self.edited(Выдержка=quote)], [], [page])
+        self.assertEqual(1, report["counts"]["bound"])
+        self.assertEqual(quote.rstrip("."), chunks[0]["text"].rstrip("."))
+        self.assertEqual(["ЯМЗ-536|all"], chunks[0]["applicability"])
+        self.assertEqual([2], chunks[0]["source_pages"])
+        for source in [dict(page, text=self.source), dict(page, text="", ocr={"status":"pending","text":quote}),
+                       dict(page, source_sha256="другая")]:
+            _, report = self.run_import([self.edited(Выдержка=quote)], [], [source])
+            self.assertEqual(1, report["counts"]["review"])
+
+
+    def test_foreign_designation_and_wrong_manual_kind_override_year_and_filename(self):
+        labels = [
+            "536.01.02 РЭ, 2013",
+            "536.01.02 РК, 2013; и ещё одно неизвестное руководство",
+            "536.01.02 РК, 2013 и 555.00.01 РК",
+            "555.00.01 РК, 2013, файл manual.pdf",
+            "РК 536.01.02, издание 2013; руководство по эксплуатации",
+        ]
+        _, report = self.run_import([self.edited(Документ=s) for s in labels])
+        self.assertEqual(len(labels), report["counts"]["review"])
+
+    def test_qualifications_and_units_cannot_be_dropped(self):
+        cases = [
+            ("Не устанавливать насос на этот двигатель.", "устанавливать насос на этот двигатель"),
+            ("Гайки крепления коллектора    50 – 55 (5,0 – 5,5)", "Гайки крепления коллектора 50 – 55 (5,0 – 5,5)"),
+            ("Предельный угол поворота вала 2°40′", "Предельный угол поворота вала 2°40"),
+        ]
+        for body, excerpt in cases:
+            with self.subTest(excerpt=excerpt):
+                page = dict(self.page, text=body)
+                chunk = _chunk(page, "Таблица", ["ЯМЗ-536"], None, [dict(page=2,text=body)], "text")
+                _, report = self.run_import([self.edited(Выдержка=excerpt)], [chunk], [page])
+                self.assertEqual(1, report["counts"]["review"])
+
+    def test_procedure_retains_physical_pages_of_both_steps(self):
+        first = "Проверить уровень масла."
+        second = "Установить детали в обратном порядке."
+        pages = [dict(self.page, text=first), dict(self.page, page=3, text=second)]
+        chunk = _chunk(self.page, "Проверка", ["ЯМЗ-536"], None,
+                       [dict(page=2,text=first), dict(page=3,text=second)], "procedure")
+        chunks, report = self.run_import([self.edited(**{"Страницы PDF":"2–3","Выдержка":first+" "+second})],
+                                         [chunk], pages)
+        self.assertEqual(1, report["counts"]["bound"])
+        self.assertEqual([2, 3], chunks[0]["fault_bindings"][0]["source_pages"])
+
+    def test_non_consecutive_pages_cannot_form_one_quote(self):
+        a, b = "Проверить все детали", "перед сборкой двигателя."
+        pages = [dict(self.page, page=1,text=a), dict(self.page,page=3,text=b)]
+        chunk = _chunk(self.page, "Проверка", ["ЯМЗ-536"], None,
+                       [dict(page=1,text=a), dict(page=3,text=b)], "procedure")
+        _, report = self.run_import([self.edited(**{"Страницы PDF":"1,3","Выдержка":a+" "+b})],
+                                    [chunk], pages)
+        self.assertEqual(1, report["counts"]["review"])
+
+
+    def test_exact_page_prefixes_and_russian_words_without_changing_units(self):
+        body = "Щуп должен входить свободно. Напряжение 30 мВ."
+        p = dict(self.page, text=body)
+        c = _chunk(p, "Проверка", ["ЯМЗ-536"], None, [dict(page=2,text=body)], "text")
+        for prefix in ("стр. ", "страница PDF ", "страницы PDF "):
+            with self.subTest(prefix=prefix):
+                records = [self.edited(**{"Страницы PDF":prefix+"2", "Выдержка":body.replace("Щуп","щуп")}),
+                           self.edited(**{"Страницы PDF":prefix+"2", "Выдержка":body.replace("мВ","МВ")})]
+                _, report = self.run_import(records, [c], [p])
+                self.assertEqual([1, 1], [report["counts"]["bound"],report["counts"]["review"]])
+
+    def test_paraphrase_with_numbered_step_in_section_and_no_variant_column(self):
+        self.headers.remove("Исполнение")
+        self.row.pop(4)
+        self.headers.append("Раздел")
+        self.row.append("")
+        body = "4. Отключить насос.\n5. " + self.source + "\n6. Снять манометр."
+        page = dict(self.page, text=body)
+        chunk = dict(self.chunk, page_parts=[dict(page=2, text=body)])
+        row = self.edited(Раздел="Проверка (пункт 5)",
+                          Выдержка="При температуре 80 °С проверить давление масла манометром.")
+        chunks, report = self.run_import([row], [chunk], [page])
+        self.assertEqual(report["counts"]["bound"], 1)
+        self.assertEqual(report["rows"][0]["match_method"], "locator")
+        link, = chunks[0]["fault_bindings"]
+        self.assertEqual(link["source_pages"], [2])
+        self.assertIn(self.source, link["excerpt"])
+        self.assertNotIn("Снять манометр", link["excerpt"])
+
+    def test_paragraph_locator_keeps_original_range_and_reports_conflicts(self):
+        self.headers.append("Место в источнике")
+        body = ("Зазор между деталями при проверке на холодном двигателе должен быть "
+                "от 0,25 до 0,30 мм.\n\nДругой узел. Норма 0,40 мм.")
+        page = dict(self.page, text=body)
+        chunk = dict(self.chunk, page_parts=[dict(page=2, text=body)])
+        confirmed = self.edited(Выдержка="Зазор на холодном двигателе — 0,25–0,30 мм.")
+        contradicted = [self.edited(Выдержка=value) for value in (
+            "Зазор 0,25–0,40 мм.", "Зазор 0,25–0,30 см.",
+            "Зазор на прогретом двигателе 0,25–0,30 мм.", "Зазор не менее 0,30 мм.")]
+        marker = "PDF 2: абзац «Зазор между деталями»"
+        chunks, report = self.run_import([row + [marker] for row in [confirmed, *contradicted]], [chunk], [page])
+        self.assertEqual(report["counts"], {"bound": 1, "review": 4, "not_found": 0})
+        self.assertEqual(chunks[0]["fault_bindings"][0]["excerpt"], body.split("\n\n")[0])
+        self.assertTrue(all(row["candidates"] for row in report["rows"][1:]))
+
+    def test_table_locator_checks_only_the_named_cell_and_keeps_source_row(self):
+        self.headers.append("Место в источнике")
+        table = {"rows": [["Узел", "Холодный двигатель, кПа", "Горячий двигатель, кПа"],
+                          ["Масляный насос", "300", "200"], ["Датчик", "200", "70"]]}
+        body = "Узел | Холодный двигатель, кПа | Горячий двигатель, кПа\nМасляный насос | 300 | 200"
+        page = dict(self.page, text=body)
+        chunk = dict(self.chunk, page_parts=[dict(page=2, text=body, tables=[table])])
+        marker = "PDF 2: строка «Масляный насос» | графа «Холодный двигатель, кПа»"
+        records = [self.edited(Выдержка=excerpt) + [marker] for excerpt in
+                   ("При проверке насоса значение 300 кПа.", "При проверке насоса значение 200 кПа.")]
+        chunks, report = self.run_import(records, [chunk], [page])
+        self.assertEqual(report["counts"]["bound"], 1)
+        self.assertEqual(report["counts"]["review"], 1)
+        self.assertIn("Масляный насос | 300 | 200", chunks[0]["fault_bindings"][0]["excerpt"])
+
+    def test_locator_requires_unique_applicable_source_and_flags_missing_page(self):
+        self.headers.append("Место в источнике")
+        body = "5. " + self.source
+        page = dict(self.page, text=body)
+        chunk = dict(self.chunk, page_parts=[dict(page=2, text=body)])
+        row = self.edited(Выдержка="Проверить давление масла при 80 °С.") + ["PDF 2: пункт 5"]
+        for chunks, entry in (([chunk, dict(chunk, id="другой")], row),
+                              ([dict(chunk, applicability=["ЯМЗ-536|А"])], row),
+                              ([chunk], row[:-1] + ["PDF 3: пункт 5"]),
+                              ([chunk], row[:-1] + ["PDF 2: пункт 7"])):
+            with self.subTest(entry=entry, scope=chunks[0]["applicability"]):
+                result, report = self.run_import([entry], chunks, [page])
+                self.assertEqual(report["counts"]["review"], 1)
+                self.assertFalse(any("fault_bindings" in chunk for chunk in result))
+                if chunks[0]["applicability"] == ["ЯМЗ-536|all"]:
+                    self.assertTrue(report["rows"][0]["candidates"])
+
+    def test_paraphrase_does_not_reverse_source_prohibition(self):
+        self.headers.append("Место в источнике")
+        body = "5. Не устанавливать уплотнение старого образца на двигатель."
+        page = dict(self.page, text=body)
+        chunk = dict(self.chunk, page_parts=[dict(page=2, text=body)])
+        claims = ["Поставить уплотнение старого образца.", "Установите старое уплотнение.",
+                  "Запрещено устанавливать уплотнение старого образца.",
+                  "Заменить турбокомпрессор."]
+        rows = [self.edited(Выдержка=claim) + ["PDF 2: пункт 5"] for claim in claims]
+        _, report = self.run_import(rows, [chunk], [page])
+        self.assertEqual([row["result"] for row in report["rows"]], ["review", "review", "bound", "review"])
+

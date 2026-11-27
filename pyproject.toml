@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Инструменты цифрового механика"
 requires-python = ">=3.11"
 dependencies = [
+    "openpyxl==3.1.5",
     "PyMuPDF==1.26.7",
     "filelock>=3.13,<4",
     "qdrant-client==1.20.0",

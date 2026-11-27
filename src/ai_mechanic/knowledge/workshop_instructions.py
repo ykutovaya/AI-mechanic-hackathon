@@ -139,3 +139,45 @@ def select_workshop_instruction(search, question):
                 search.add(hit, sentence)
                 return True
     return False
+
+
+def installation_torque(search, question):
+    """Связывает момент с пронумерованным крепежом внутри одного шага установки."""
+    match = re.search(r"\bпри установке\s+([^?,]{3,60}?)\s*,?\s+(?:какой|каков|с каким)\s+момент"
+                      r"(?:ом)?\s+затяжки\s+(болтов|гаек|винтов)\s+(.+?)[?!.]*$", question, re.I)
+    if not match:
+        return None
+    assembly, fastener, subject = match.groups()
+    def part_names(text):
+        return {word.replace("патрубок", "патрубк") for word in _terms(text)}
+
+    required = part_names(subject) - {"на", "к", "при", "в"}
+    part = {"болтов": "болт", "гаек": "гайк", "винтов": "винт"}[fastener.lower()]
+    number = re.compile(rf"\b{part}[а-я]*\s*\((\d+)\)", re.I)
+    unit = re.compile(r"\b\d+(?:[.,]\d+)?(?:\s*[-–—…]\s*\d+(?:[.,]\d+)?)?\s*Н\s*[·⋅.]?\s*м\b", re.I)
+    matches = {}
+    for hit in search.primary:
+        if not _terms(assembly) <= _terms(hit.get("section", "")):
+            continue
+        for step in re.split(r"(?m)^\s*\d+[.)]\s+", hit["text"]):
+            sentences = _SENTENCES.split(clean(step))
+            for index, sentence in enumerate(sentences):
+                tags = set(number.findall(sentence))
+                if len(tags) != 1 or not required <= part_names(sentence):
+                    continue
+                for end in range(index, min(index + 3, len(sentences))):
+                    window = " ".join(sentences[index:end + 1])
+                    if set(number.findall(window)) != tags:
+                        break
+                    # При смене крепежа отсчёт момента для первого болта заканчивается.
+                    if end > index and re.search(r"\b(?:болт|гайк|винт)[а-я]*\b", sentences[end], re.I):
+                        if not tags.intersection(number.findall(sentences[end])):
+                            break
+                    values = unit.findall(window)
+                    if len(values) == 1 and re.search(r"затя(?:н|ж)|завернуть", window, re.I):
+                        matches.setdefault(clean(values[0]), (hit, window))
+                        break
+    if len(matches) == 1:
+        search.add(*next(iter(matches.values())))
+        return ""
+    return "В найденных шагах установки не удалось однозначно связать момент затяжки с указанным крепежом."

@@ -8,10 +8,12 @@ import unicodedata
 
 from qdrant_client.http.exceptions import ApiException
 
+from .figure_legends import select_figure_positions
 from .normative_tables import select_normative_rows
 from .oil_maintenance import select_oil_maintenance
+from .defect_card import select_defect_card
 from .component_limits import select_component_limit
-from .workshop_instructions import select_workshop_instruction
+from .workshop_instructions import installation_torque, select_workshop_instruction
 from .qdrant_chunks import extract_span
 from ._qdrant_store import COLLECTION, URL, QdrantSearch
 from .search_queries import FUEL_SYSTEM, OIL_LEVEL, OIL_SIGNAL, mentions_pressure_drop
@@ -49,6 +51,11 @@ class _Search:
         self.queries = []
         self.evidence = []
         self.results = {}
+        self.manual_type = None
+        if re.search(r"руководств\w* по эксплуатации|\bпо РЭ\b", primary, re.I):
+            self.manual_type = re.compile(r"эксплуатаци|\bРЭ\b", re.I)
+        elif re.search(r"руководств\w* по ремонту|\bпо РК\b", primary, re.I):
+            self.manual_type = re.compile(r"ремонт|\bРК\b", re.I)
         self.primary = self._lookup(primary)
 
     def _lookup(self, query):
@@ -58,6 +65,8 @@ class _Search:
                 hits = self.backend.search(self.engine, query, variant=self.variant, limit=12)
             except (ApiException, OSError, ValueError, RuntimeError) as exc:
                 raise SearchUnavailable("Поиск по руководствам недоступен. Проверьте Qdrant, коллекцию и локальные модели.") from exc
+            if self.manual_type:
+                hits = [hit for hit in hits if self.manual_type.search(hit.get("title", ""))]
             self.results[query] = hits
         return self.results[query]
 
@@ -308,6 +317,10 @@ def _diagram(search, codes):
 def _valve(search, question):
     search.passage("редукционный клапан регулировке",
                    r"Редукционный клапан регулировке не подлежит\.(?: Детали клапана[^.]*\.)?")
+    if "редукцион" in question and "масл" in question and re.search(r"промыв|промыт|промыва|промо|засор|чисти", question):
+        search.passage("промывка редукционного клапана масляного насоса при засорении",
+                       r"[^.!?]*\bзасорени\w* редукционного клапана масляного насоса\.\s*"
+                       r"(?:В этом случае\s+)?редукционный клапан\b[^.!?]*\bпромы\w*[^.!?]*\.")
     if re.search(r"разбор|разобр|перебор|плунжер|пружин|дефектов", question):
         search.passage("выявить неисправности насоса", r"Чтобы выявить неисправности насоса[^.]*\.")
         search.passage("плунжер редукционного клапана",
@@ -1346,6 +1359,9 @@ def retrieve(backend, engine, question, diagnosis=None, topic="", *, variant=Non
                 clarification = "Уточните исполнение двигателя по табличке, чтобы подобрать процедуру для указанного фильтра."
             else:
                 missing = "Для этого исполнения двигателя и номера фильтра процедура слива воды не найдена."
+    elif (legend := select_figure_positions(search, q)) is not None:
+        topic = "diagram"
+        missing = legend
     elif re.search(r"схем|обознач|расшифр", q) and codes:
         topic = "diagram"
         _diagram(search, codes)
@@ -1366,6 +1382,9 @@ def retrieve(backend, engine, question, diagnosis=None, topic="", *, variant=Non
                 if fields:
                     search.add(hit, fields.group())
                     break
+    elif (decision := select_defect_card(search, q)) is not None:
+        topic = "defect-card"
+        missing = decision
     elif (limit := select_component_limit(search, q)) is not None:
         topic = "component-limit"
         missing = limit
@@ -1385,10 +1404,15 @@ def retrieve(backend, engine, question, diagnosis=None, topic="", *, variant=Non
         topic = "valve-clearance"
         search.passage("теплового зазора", r"Величина теплового зазора у впускного и выпускного"
                        r".{1,500}?на холодном двигателе")
-        search.passage("торцом клапана", r"Вставив щуп в зазор.{1,950}?с усилием\.")
+        if not search.passage("торцом клапана", r"Вставив щуп в зазор.{1,950}?с усилием\."):
+            search.passage("торцом клапана", r"Вставив щуп в зазор между[^.]{10,600}?в пределах\s+"
+                           r"\d+[,\.]\d+\s*[-–—…]\s*\d+[,\.]\d+\s*мм\.")
     elif "клапан" in q and ("редукцион" in q or "насос" in q or prev_oil and not re.search(r"впуск|выпуск|теплов|зазор", q)):
         topic = "oil-valve"
         _valve(search, q)
+    elif (torque := installation_torque(search, q)) is not None:
+        topic = "installation-torque"
+        missing = torque
     elif select_workshop_instruction(search, q):
         topic = "workshop-instruction"
     elif _disassembly(search, q):

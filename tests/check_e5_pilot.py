@@ -115,6 +115,13 @@ def score_case(case, lookups, excerpts, reply):
     if link_errors or reply.get("warnings"):
         failures.append("source_error")
 
+    forbidden = {_key(ref) for ref in case.get("forbidden_sources", [])}
+    observed = {_key(hit) for group in lookups for hit in group}
+    observed.update(_key(ref) for ref in [*excerpts, *reply["sources"]])
+    foreign_pages = sorted(forbidden & observed)
+    if foreign_pages:
+        failures.append("inapplicable_source")
+
     refusal = None
     if case.get("insufficient_evidence"):
         text = _clean(reply["text"])
@@ -132,12 +139,20 @@ def score_case(case, lookups, excerpts, reply):
         "answer": {"text": reply["text"], "sources": reply["sources"], "refusal_ok": refusal,
                    "all_facts": all(check["in_answer"] for check in checks) if checks else None,
                    "link_errors": link_errors, "warnings": reply.get("warnings", [])},
+        "inapplicable_sources": [_source(ref) for ref in foreign_pages],
         "facts": checks, "failures": list(dict.fromkeys(failures)),
     }
 
 
 def _nonempty(value):
     return isinstance(value, str) and bool(value.strip())
+
+
+def _valid_sources(refs):
+    return isinstance(refs, list) and all(
+        isinstance(ref, dict) and _nonempty(ref.get("document_id"))
+        and type(ref.get("page")) is int and ref["page"] > 0 for ref in refs
+    )
 
 
 def validate_cases(cases, machines):
@@ -167,11 +182,14 @@ def validate_cases(cases, machines):
             terms, sources = fact.get("terms"), fact.get("sources")
             if not isinstance(terms, list) or not terms or not all(_nonempty(term) for term in terms):
                 raise ValueError(f"{key}: укажите непустой список строк terms.")
-            if not isinstance(sources, list) or not sources or not all(
-                isinstance(ref, dict) and _nonempty(ref.get("document_id"))
-                and type(ref.get("page")) is int and ref["page"] > 0 for ref in sources
-            ):
+            if not sources or not _valid_sources(sources):
                 raise ValueError(f"{key}: укажите документ и физическую страницу для каждого факта.")
+        forbidden = case.get("forbidden_sources", [])
+        if not _valid_sources(forbidden):
+            raise ValueError(f"{key}: проверьте документ и физическую страницу в forbidden_sources.")
+        positives = {_key(ref) for fact in facts for ref in fact["sources"]}
+        if positives.intersection(map(_key, forbidden)):
+            raise ValueError(f"{key}: одна страница одновременно указана как ожидаемая и неприменимая.")
 
 
 class RecordingSearch(QdrantSearch):

@@ -37,6 +37,25 @@ class ChunksTests(unittest.TestCase):
         self.assertNotIn("Неверный", str(chunks))
         self.assertNotIn("Неразмеченная", str(chunks))
 
+    def test_module_marks_all_models_but_keeps_body_restrictions(self):
+        header = ("Руководство по ремонту\nдвигателей ЯМЗ-536, ЯМЗ-5361,\n"
+                  "ЯМЗ-5363, ЯМЗ-53602, ЯМЗ-53622, ЯМЗ-53642\n\n")
+        body = "Монтаж рампы\n\nЗакрепить трубку рампы."
+        footer = "\n\nДействительно: Все     536-20-050020-420\n2013-02-12  Страница 4"
+        def model_page(text):
+            return dict(page(505, text), engine_models=["ЯМЗ-536"], section="Page 6")
+
+        chunks = self.make([model_page(header + body + footer)])
+        self.assertTrue(chunks)
+        self.assertEqual(chunks[0]["section"], "Монтаж рампы")
+        self.assertEqual(chunks[0]["applicability"], ["ЯМЗ-536|all"])
+        self.assertTrue(all("ЯМЗ-53642" not in c["text"] for c in chunks))
+        for text in (header + body, header + body + footer.replace("Все", "ЯМЗ-5361"),
+                     header.replace("ЯМЗ-536,", "ЯМЗ-5368,") + body + footer,
+                     header + body + " Только для ЯМЗ-5361." + footer):
+            with self.subTest(text=text):
+                self.assertEqual(self.make([model_page(text)]), [])
+
     def test_table_units_and_merged_cell(self):
         r = page(3,"Таблица",tables=[{"rows":[["Датчик","Давление, кПа","R, Ом"],
                         ["23.3829","0","10"],[None,"1,5","8"]]}])
@@ -100,6 +119,42 @@ class ChunksTests(unittest.TestCase):
             (root/"pages").write_text(json.dumps(r),encoding="utf-8")
             (root/"notes").write_text("[]",encoding="utf-8")
             self.assertEqual(len(load_chunks(root/"pages",root/"notes",root/"registry")),1)
+
+    def test_expert_build_records_frozen_inputs_and_physical_coverage(self):
+        import hashlib
+        import json
+        import tempfile
+        from pathlib import Path
+        import pymupdf
+        from openpyxl import Workbook
+        from ai_mechanic.knowledge.qdrant_index import load_chunks
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pdf_path = root / "manual.pdf"
+            with pymupdf.open() as pdf:
+                pdf.new_page()
+                pdf.save(pdf_path)
+            row = page(1, "Проверить привод.")
+            row.update(path=str(pdf_path), source_sha256=hashlib.sha256(pdf_path.read_bytes()).hexdigest())
+            for name, value in (("pages", row), ("registry", [row]), ("notes", [])):
+                (root/name).write_text(json.dumps(value), encoding="utf8")
+            book = Workbook()
+            book.active.append(["Код", "Название неисправности", "description", "vehicle_id", "model",
+                                "Модель двигателя", "Исполнение", "Поисковые термины", "Документ",
+                                "Раздел", "Страницы PDF", "Выдержка", "Статус", "Примечание"])
+            book.save(root/"sources.xlsx")
+            (root/"vehicles.json").write_text('{"vehicles": []}')
+            (root/"faults.json").write_text("[]")
+            report = root/"reports"/"audit.json"
+            chunks = load_chunks(root/"pages", root/"notes", root/"registry",
+                                 expert_sources=root/"sources.xlsx", expert_report=report,
+                                 vehicles=root/"vehicles.json", fault_types=root/"faults.json")
+            audit = json.loads(report.read_text(encoding="utf8"))
+            self.assertEqual(audit["inputs_sha256"]["expert_sources"],
+                             hashlib.sha256((root/"sources.xlsx").read_bytes()).hexdigest())
+            self.assertEqual(audit["documents"]["d"],
+                             {"pdf_pages": 1, "indexed_pages": [1], "chunks": len(chunks)})
 
     def test_combined_manual_ocr_requires_confirmed_scope(self):
         text = "Данные из изображения."

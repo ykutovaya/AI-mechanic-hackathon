@@ -141,6 +141,40 @@ class ManualSessionTest(unittest.TestCase):
         self.assertTrue(any(step["role"] == "work" and step["page"] == 2
                             for step in answer["inspection_steps"]))
 
+    def test_valve_clearance_uses_requested_manual_and_one_complete_step(self):
+        from ai_mechanic.knowledge.search import retrieve
+        from unittest.mock import Mock
+        excerpt = ("Вставив щуп в зазор между торцом клапана и носком коромысла, проверить зазоры "
+                   "первого цилиндра и отрегулировать их в пределах 0,25 - 0,30 мм.")
+        source = dict(self.evidence[0], text=excerpt, section="Регулировка")
+        other = dict(source, title="236.01.01 РК", document_id="repair",
+                     text=excerpt + " Щуп должен входить с усилием.")
+        right = dict(source, title="236-3902150-Б РЭ", document_id="operation")
+        result = retrieve(Mock(**{"search.return_value": [other, right]}), "ДВС-1",
+                          "По руководству по эксплуатации, куда вставить щуп при регулировке клапанов "
+                          "первого цилиндра и какой зазор выставить?")
+        self.assertEqual([(v["document_id"], v["excerpt"]) for v in result["evidence"]], [("operation", excerpt)])
+
+    def test_installation_torque_follows_bolt_number_within_same_step(self):
+        from ai_mechanic.knowledge.search import retrieve
+        from unittest.mock import Mock
+        question = ("При установке термостатов какой момент затяжки болтов отводящего патрубка "
+                    "на сервисном модуле?")
+        operation = ("3. Установить отводящий патрубок (6) на сервисный модуль, предварительно ввернув "
+                     "от руки 3 болта (7) в отверстия сервисного модуля.\n"
+                     "Окончательно затянуть болты (7) ключом S=13. Момент затяжки Мкр = 20–25 Н·м.")
+        hit = dict(self.evidence[0], kind="text", section="Установка термостатов", text=operation)
+        wrong = dict(hit, section="Установка сервисного модуля", text=operation.replace("20–25", "60–65"))
+        def answer(hits):
+            return retrieve(Mock(**{"search.return_value": hits}), "ДВС-1", question)["evidence"]
+
+        evidence = answer([wrong, hit])
+        self.assertEqual(len(evidence), 1)
+        self.assertIn("20–25 Н·м", evidence[0]["excerpt"])
+        self.assertIn("патрубок", evidence[0]["excerpt"])
+        self.assertFalse(answer([wrong]))
+        self.assertFalse(answer([dict(hit, text=operation.replace("болты (7)", "болты (8)"))]))
+
     def test_disassembly_keeps_five_steps_under_one_citation(self):
         hit = dict(self.evidence[1], kind="text", section="Разборка двигателя", text=(
             "Разборка насоса\n"

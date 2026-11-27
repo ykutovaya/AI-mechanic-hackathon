@@ -103,6 +103,25 @@ def _table_parts(table, footnotes):
         yield part(group)
 
 
+def _module_page(page):
+    """Читает область действия из печатных колонтитулов модульного руководства."""
+    text = page["text"]
+    model = r"ЯМЗ-\d+[А-Яа-я\d.-]*"
+    header = re.match(r"\s*Руководство по ремонту\s+двигателей\s+("
+                      + model + r"(?:,\s*" + model + r")+)\s*\n", text)
+    if not header or not set(page["engine_models"]).issubset(re.findall(model, header[1])):
+        return page
+    footer = re.search(r"(?m)^\s*Действительно:\s*Все[ \t]+[\d-]+\s+"
+                       r"\d{4}-\d{2}-\d{2}\s+Страница\s+\d+\s*\Z", text)
+    if not footer:
+        return page
+    body = text[header.end():footer.start()].strip()
+    section = page["section"]
+    if body and re.fullmatch(r"Page \d+", section):
+        section = body.splitlines()[0].strip()
+    return dict(page, text=body, section=section)
+
+
 def _model_restriction(page, allowed):
     body = clean(page["text"]).casefold().replace("–","-").replace("—","-")
     if re.search(r"(?:на части|на отдельных|в зависимости от комплектации|по спецзаказу|при наличии|на двигателях с |на двигателях без |для двигател(?:ей|я) с |(?:могут|может) (?:устанавлива|комплектова)|исполнени[ияюй]|на модификац|комплектаци[ияйюях]|(?:с|без) адаптер(?:ом|а)|для ранних|ранних лет выпуска|втулочны[ехми]+ цеп|зубчаты[ехми]+ цеп)",body):
@@ -222,7 +241,7 @@ def _numbered_entries(pages, note):
 
 def make_chunks(rows, notes=()):
     """Строит воспроизводимые записи. Ссылки на соседние листы сами не расширяют источник."""
-    pages = {(r["document_id"], r["page"]):r for r in rows}
+    pages = {(r["document_id"], r["page"]): _module_page(r) for r in rows}
     annotations = {(n["document_id"],n["page"]):n for n in notes}
     scopes = _reviewed_sections(notes,pages)
     common_tables = {}

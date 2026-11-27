@@ -62,6 +62,23 @@ class SearchReportTests(unittest.TestCase):
         self.assertFalse(leaked["answer"]["refusal_ok"])
         self.assertIn("expected_refusal_missing", leaked["failures"])
 
+    def test_rejects_a_foreign_page_even_with_the_same_document_and_model_tag(self):
+        case = CASE | {"forbidden_sources": [source(21)]}
+        fact = passage(12, FACT)
+        other = passage(21, "Схема другого двигателя.")
+        clean = score_case(case, [[fact]], [fact], GOOD_REPLY)
+        self.assertEqual(clean["failures"], [])
+        retrieved = score_case(case, [[fact], [other]], [fact], GOOD_REPLY)
+        self.assertIn("inapplicable_source", retrieved["failures"])
+        cited = score_case(case, [[fact]], [fact], {**GOOD_REPLY, "sources": [citation(12), citation(21)]})
+        self.assertIn("inapplicable_source", cited["failures"])
+
+    def test_rejects_ambiguous_or_malformed_forbidden_pages(self):
+        machines = {"V1": {"history": [{"check_id": "S1"}]}}
+        for forbidden in ([source(0)], [source(12)], "guide", [{}]):
+            with self.subTest(forbidden=forbidden), self.assertRaises(ValueError):
+                validate_cases([CASE | {"forbidden_sources": forbidden}], machines)
+
     def test_validates_exact_vehicle_and_session_pairs(self):
         machines = {
             "V1": {"engine_model": "A", "history": [{"check_id": "S1"}]},

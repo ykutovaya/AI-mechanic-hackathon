@@ -13,7 +13,7 @@ from filelock import FileLock
 from qdrant_client import QdrantClient, models
 
 from ._e5 import BM25_PARAMETERS, E5Embeddings, E5_REVISION
-from .search_queries import followup_queries
+from .search_queries import OIL_CAUSES, followup_queries, pump_inspection_queries
 
 
 URL = "http://127.0.0.1:6333"
@@ -168,7 +168,10 @@ class QdrantSearch:
         if not extra:
             return primary
 
-        rankings = [primary, *(self._ranked_chunks(physical, encoder, term, allowed, limit) for term in extra)]
+        branches = {term: self._ranked_chunks(physical, encoder, term, allowed, limit) for term in extra}
+        grounded = pump_inspection_queries(branches.get(OIL_CAUSES, ()))
+        rankings = [primary, *(self._ranked_chunks(physical, encoder, term, allowed, limit) for term in grounded),
+                    *branches.values()]
         selected = {}
         for group in zip_longest(*rankings):
             for chunk in group:
