@@ -81,7 +81,6 @@ function chooseMachine() {
   check.selectedIndex = check.options.length - 1;
   check.disabled = !row?.history.length;
   el("current-engine").textContent = row?.engine_model || "";
-  el("current-variant").textContent = row?.engine_variant || "Не указано";
   reset();
 }
 

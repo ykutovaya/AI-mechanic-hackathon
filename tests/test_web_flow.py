@@ -119,6 +119,15 @@ class WebFixture(unittest.TestCase):
 
 
 class WebFlowTests(WebFixture):
+
+    def test_machine_picker_shows_no_standalone_variant(self):
+        with urlopen(self.url + "/") as response:
+            html = response.read().decode("utf-8")
+        picker = html.split("<aside", 1)[1].split("</aside>", 1)[0]
+        self.assertIn('for="machine"', picker)
+        self.assertIn('for="check"', picker)
+        self.assertNotIn("Исполнение", picker)
+
     def test_question_and_source_do_not_trigger_diagnosis(self):
         self.assertEqual(self.request("/api/machines")["machines"][0]["engine_model"], "ЗМЗ-5234.10")
         car = {"machine_id": "vehicle", "check_id": "good"}

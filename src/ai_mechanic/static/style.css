@@ -92,7 +92,6 @@ a,.retry { color: #1d614d; text-underline-offset: 3px; }
 .order-actions .primary { margin-top: 0; }
 @media (max-width: 760px) { #order-start { margin-top: 0; } .order-body { padding: 0 13px 14px; } .order-heading { padding: 12px; } }
 
-.engine-details { grid-column: 1/-1; color: var(--muted); font-size: 14px; margin-bottom: 8px; }
 .message > h4 { margin: 8px 0; }
 #source-dialog { width: min(920px, calc(100% - 16px)); max-height: 94dvh; color: var(--ink);
   border: 1px solid var(--line); border-radius: 12px; padding: 0 14px 12px; }
