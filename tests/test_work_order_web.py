@@ -32,16 +32,27 @@ class WorkOrderWebTests(WebFixture):
         self.request("/api/orders/new", context | {"revision": sent["revision"]})
         self.assertEqual(len(self.ml_calls), 1)
 
-    def test_reject_work_without_supporting_source(self):
+    def test_accepts_mechanics_work_and_sends_it_in_confirmed_revision(self):
         context = {"context_id": self.diagnose()["context_id"]}
         draft = self.request("/api/orders/draft", context)
-        selection = context | {key: draft[key] for key in ("draft_id", "revision")}
-        self.assert_http_error(400, "/api/orders/update", selection | {
-            "changes": {"works": ["Заменить турбокомпрессор."]},
-        })
-        after = self.request("/api/orders/draft", context)
-        self.assertEqual(after["revision"], draft["revision"])
+        original = context | {key: draft[key] for key in ("draft_id", "revision")}
+        work = "Выполнить дефектовку стука."
+        works = [work]
+        update = self.request("/api/orders/update", original | {"changes": {"works": works}})
+        self.assertEqual(update["payload"]["works"], works)
+        self.assertEqual(update["manual_works"], [work])
+        self.assertEqual(update["payload"]["sources"], draft["payload"]["sources"])
+        self.assertGreater(update["revision"], draft["revision"])
+        self.assertEqual(self.request("/api/orders/draft", context), update)
+        self.assert_http_error(409, "/api/orders/send", original | {"confirmed": True})
         self.assertEqual(self.ticket_calls, [])
+
+        sent = self.request("/api/orders/send", original | {"revision": update["revision"], "confirmed": True})
+        self.assertEqual(sent["number"], "TKT-0018")
+        self.assertEqual(sent["manual_works"], [work])
+        self.assertEqual(self.ticket_calls[0]["operations"], works)
+        self.assertEqual(self.ticket_calls[0]["references"], [{"manual": "ЗМЗ-5234.10. РК", "pdf_page": 2}])
+        self.assertEqual(len(self.ml_calls), 1)
 
     def test_supported_edit_rechecks_source_and_advances_revision(self):
         context = {"context_id": self.diagnose()["context_id"]}

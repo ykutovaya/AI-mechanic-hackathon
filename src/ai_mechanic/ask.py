@@ -183,6 +183,8 @@ class ManualSession:
         ]
         self.selection = None
         self.topic = ""
+        self.clarification = ""
+        self.search_hint = ""
 
     def _reading_references(self, reply, backend, engine, variant, code):
         seen = {}
@@ -237,6 +239,7 @@ class ManualSession:
 
     def ask(self, machine_id, question, *, check_id=None, diagnosis=None):
         """Отвечает по руководству и использует полученный ранее результат ML."""
+        self.clarification = ""
         question = question.strip()
         if not question:
             raise ValueError("Введите вопрос по руководству.")
@@ -310,8 +313,9 @@ class ManualSession:
                     )
             return reply
         backend = self.search if self.search is not None else configured_search()
+        hint = {"search_hint": self.search_hint} if self.search_hint else {}
         result = self.retrieve(backend, engine, question, diagnosis=diagnosis, topic=self.topic,
-                               variant=variant, procedures=self.procedures)
+                               variant=variant, procedures=self.procedures, **hint)
         self.topic = result.get("topic") or ""
         if result.get("manual_reference") and (result["evidence"] or result["needs_clarification"]):
             lines.clear()
@@ -366,7 +370,8 @@ class ManualSession:
         if needs_clarification:
             reply["needs_clarification"] = True
         if result.get("clarification") and (evidence_lines or needs_clarification):
-            lines.append(result["clarification"])
+            self.clarification = result["clarification"]
+            lines.append(self.clarification)
         if evidence_lines:
             reply["synthesis"] = "extractive"
             lines.extend(evidence_lines)

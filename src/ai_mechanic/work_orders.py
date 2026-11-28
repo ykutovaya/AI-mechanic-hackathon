@@ -17,6 +17,7 @@ from .knowledge.diagnostic_works import CHAIN_CHECK_ID, CHAIN_REPLACEMENT_TOPIC,
 from .knowledge.generator_bearing import (
     BEARING_CONFIRMED, GENERATOR_BEARING_SOURCE, GENERATOR_BEARING_WORK, GENERATOR_ROTOR_REASON, ROTOR_CONFIRMED,
 )
+from .knowledge.search import SearchUnavailable
 from .knowledge.yamz236_oil import OIL_CHECK_ID, OIL_MEASUREMENT_CONFIRMED_TOPIC, OIL_WORK, OIL_WORK_SOURCES
 from .knowledge.yamz536_oil import (
     YAMZ536_CHECK_ID, YAMZ536_OIL_CONFIRMED_TOPIC, YAMZ536_OIL_WORK_SOURCES, YAMZ536_OIL_WORKS,
@@ -94,8 +95,18 @@ def _json(data):
     return json.dumps(data, ensure_ascii=False, sort_keys=True)
 
 
+def _work_text(text):
+    return " ".join(text.casefold().split()).rstrip(".!?")
+
+
+def _manual_works(works, proposed):
+    proposed_names = {_work_text(work) for work in proposed}
+    return [work for work in works if _work_text(work) not in proposed_names]
+
+
 def _snapshot(row):
     payload = json.loads(row["payload"])
+    proposed = json.loads(row["original_payload"])
     reason = "Диагностика выявила отклонение, причина требует проверки."
     if row["lamp_at_speed"]:
         reason = "Механик сообщил, что лампа аварийного давления масла горела на средних оборотах."
@@ -103,7 +114,7 @@ def _snapshot(row):
             reason += " Рекомендован высокий приоритет. Итоговый приоритет выбран механиком."
     elif row["priority_reason"]:
         reason = row["priority_reason"]
-        if payload["priority"] != json.loads(row["original_payload"])["priority"]:
+        if payload["priority"] != proposed["priority"]:
             reason += " Итоговый приоритет выбран механиком."
     elif payload["priority"] != "medium":
         reason = "Приоритет выбран механиком."
@@ -111,7 +122,8 @@ def _snapshot(row):
                 machine_id=row["machine_id"], check_id=row["check_id"],
                 revision=row["revision"], status=row["status"], number=row["number"], sent_at=row["sent_at"],
                 lamp_supported=bool(row["lamp_supported"]), lamp_at_speed=bool(row["lamp_at_speed"]),
-                priority_reason=reason, payload=payload)
+                priority_reason=reason, payload=payload,
+                manual_works=_manual_works(payload["works"], proposed["works"]))
 
 
 class DraftChanged(ValueError):
@@ -368,10 +380,19 @@ class WorkOrders:
         if lamp_at_speed != lamp_before and "priority" not in changes:
             body["priority"] = "high" if lamp_at_speed else "medium"
         validate_order(body)
-        if self.verify_works and body["works"] != current["works"]:
-            body["sources"] = self.verify_works(row["machine_id"], row["check_id"],
-                                                body["works"], current["sources"])
-            validate_order(body)
+        if body["works"] != current["works"]:
+            proposed = json.loads(row["original_payload"])
+            body["sources"] = proposed["sources"]
+            # Ссылки на исходную диагностику сохраняются для работ механика.
+            if self.verify_works and not _manual_works(body["works"], proposed["works"]):
+                try:
+                    checked = self.verify_works(row["machine_id"], row["check_id"],
+                                                body["works"], proposed["sources"])
+                    validate_order(dict(body, sources=checked))
+                except (OSError, ValueError, SearchUnavailable):
+                    pass
+                else:
+                    body["sources"] = checked
         encoded = _json(body)
         with self._transaction() as conn:
             row = self._version(conn, cid, draft_id, revision)

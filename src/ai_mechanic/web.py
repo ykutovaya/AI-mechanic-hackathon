@@ -1,6 +1,7 @@
 """Веб-чат механика. Запуск из корня проекта: python -m ai_mechanic.web."""
 
 import argparse
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from functools import partial
 from html import escape
@@ -13,6 +14,7 @@ import sqlite3
 import sys
 from threading import Lock
 from urllib.parse import quote, unquote, urlsplit
+from uuid import uuid4
 
 import pymupdf
 
@@ -35,12 +37,12 @@ from .knowledge.yamz536_oil import (
 from .knowledge.zmz40904_oil import ZMZ40904_OIL_CONFIRMED_TOPIC, ZMZ40904_OIL_TOPIC, zmz40904_oil_observation_question
 from .knowledge.zmz5234_oil_knock import (
     ZMZ5234_CHECK_ID, ZMZ5234_OIL_KNOCK_TOPIC, ZMZ5234_REPAIR_CONFIRMED_TOPIC, ZMZ5234_REPAIR_SOURCE,
-    ZMZ5234_REPAIR_WORK, zmz5234_oil_observation_question,
+    ZMZ5234_REPAIR_WORK, zmz5234_contextual_answer, zmz5234_model_answer, zmz5234_oil_observation_question,
 )
 from .knowledge.search import SearchUnavailable, add_search_arguments, configured_search
 from .ml_client import MLUnavailable, fetch_diagnosis
 from .work_order_service import OrderServiceError, submit_order
-from .work_orders import DraftChanged, WorkOrders
+from .work_orders import DraftChanged, WorkOrders, _work_text
 from .yandex_gpt import YandexGPT, order_reference_answer
 
 
@@ -132,10 +134,6 @@ class _Observation:
         return cls(topic, contexts, drive, oil)
 
 
-def _work_text(text):
-    return " ".join(text.casefold().split()).rstrip(".!?")
-
-
 class Workshop:
     """Связывает выбранную проверку, поиск по руководству и черновик заявки."""
 
@@ -148,6 +146,7 @@ class Workshop:
         self.machines = {m["machine_id"]: m for m in settings.machines}
         self.diagnostics = {}
         self.observations = {}
+        self.dialogues = OrderedDict()
         self.diagnostics_lock = Lock()
         self.orders = WorkOrders(partial(submit_order, toir_url), root / orders_db,
                                  owns_check=self._owns_check, verify_works=self._verify_works)
@@ -174,7 +173,7 @@ class Workshop:
         return bool(machine and any(c["check_id"] == check_id for c in machine["history"]))
 
     def _verify_works(self, machine_id, check_id, works, sources):
-        """Повторно проверяет поддерживающую процедуру для изменённого списка работ."""
+        """Уточняет ссылки, когда в черновике остались только предложенные работы."""
         selection = machine_id, check_id
         with self.diagnostics_lock:
             diagnostic = self.diagnostics.get(selection)
@@ -228,6 +227,22 @@ class Workshop:
                 raise ValueError("Сверьте наблюдения и страницы руководства для выбранной работы по сцеплению.")
         return list(related.values())
 
+    def _previous_turn(self, identifier, selection):
+        if isinstance(identifier, str) and len(identifier) == 32:
+            with self.diagnostics_lock:
+                turn = self.dialogues.get(identifier)
+            if turn and turn[0] == selection:
+                return turn[1], turn[2]
+        return "", ""
+
+    def _remember_turn(self, selection, question, clarification):
+        identifier = uuid4().hex
+        with self.diagnostics_lock:
+            self.dialogues[identifier] = (selection, question, clarification[:1000])
+            if len(self.dialogues) > 256:
+                self.dialogues.popitem(last=False)
+        return identifier
+
     def answer(self, path, data):
         machine_id = _field(data, "machine_id")
         requested = path == "/api/diagnose"
@@ -245,6 +260,7 @@ class Workshop:
         session = self.session()
         observation_answer = False
         oil = None
+        analysis_usage = None
         if requested:
             if data.get("previous_context_id"):
                 self.orders.invalidate(_field(data, "previous_context_id"))
@@ -253,16 +269,36 @@ class Workshop:
                 ". Что уточнить у водителя и что проверить на двигателе?"
             )
         else:
-            question = _field(data, "question", limit=3000)
+            question = raw_question = _field(data, "question", limit=3000)
             previous = _field(data, "topic", optional=True, limit=1000) if data.get("topic") else None
+            previous_topic = None
             if previous:
                 # Тема относится только к ранее выбранной паре машины и проверки.
                 state = json.loads(previous)
                 if (isinstance(state, list) and len(state) == 3 and tuple(state[:2]) == selection
-                        and isinstance(state[2], str) and not _observation_rule(state[2], machine["engine_model"])):
-                    session.selection = selection
-                    session.topic = state[2]
+                        and isinstance(state[2], str)):
+                    previous_topic = state[2]
+                    if not _observation_rule(previous_topic, machine["engine_model"]):
+                        session.selection, session.topic = selection, previous_topic
+            cid = data.get("context_id")
+            same_observation = (observed is not None and previous_topic == observed.topic
+                                and isinstance(cid, str) and cid in observed.contexts)
+            oil_knock = (same_observation and check_id == ZMZ5234_CHECK_ID
+                         and observed.topic.partition(":")[0] == ZMZ5234_OIL_KNOCK_TOPIC
+                         and observed.topic != ZMZ5234_REPAIR_CONFIRMED_TOPIC)
+            analysis = {}
+            if self.answer_model is not None:
+                last_question, clarification = self._previous_turn(data.get("dialogue_id"), selection)
+                result = self.answer_model.analyze_turn(raw_question, last_question, clarification, oil_knock=oil_knock)
+                if result is not None:
+                    analysis, analysis_usage = result
+                    session.search_hint = analysis["query"]
+
             if observed:
+                if same_observation:
+                    question = zmz5234_contextual_answer(question, observed.topic)
+                if oil_knock and analysis.get("knock"):
+                    question = zmz5234_model_answer(raw_question, question, observed.topic, analysis["knock"])
                 code, recognizes = _OBSERVATIONS[observed.topic.partition(":")[0]]
                 observation_answer = recognizes(question)
                 if observed.oil is not None:
@@ -318,8 +354,14 @@ class Workshop:
             if data.get("context_id"):
                 cid = _field(data, "context_id")
                 reply["order_context_changed"] = not self.orders.refresh(cid, *selection, diagnostic)
-        if not requested and diagnostic is None and self.answer_model is not None:
-            order_reference_answer(reply, question, session.topic, self.answer_model)
+        if self.answer_model is not None:
+            if not requested and diagnostic is None:
+                order_reference_answer(reply, question, session.topic, self.answer_model)
+            reply["dialogue_id"] = self._remember_turn(
+                selection, question if requested else raw_question, getattr(session, "clarification", ""),
+            )
+        if analysis_usage is not None:
+            reply["analysis_usage"] = analysis_usage
         reply.pop("inspection_steps", None)
         return reply
 

@@ -286,9 +286,6 @@ class QualifiedOrderTests(unittest.TestCase):
         self.assertEqual(draft["payload"]["works"], ["Проверить работу сцепления и регулировку привода выключения"])
         self.assertEqual({s["page"] for s in draft["payload"]["sources"]}, {120, 121})
         replacement = "Заменить муфту выключения сцепления с подшипником"
-        version = {key: draft[key] for key in ("context_id", "draft_id", "revision")}
-        with self.assertRaises(HTTPError):
-            self.post("orders/update", **version, changes={"works": [replacement]})
         defect = self.ask("S-0024", "Подтвердили износ подшипника муфты выключения сцепления.")
         self.assertIn("после смазки", defect["text"])
         unchanged = self.post("orders/draft", context_id=draft["context_id"])
@@ -299,11 +296,30 @@ class QualifiedOrderTests(unittest.TestCase):
         approved = self.ask("S-0024", "После смазки муфты шум сохранился.")
         repair = self.post("orders/draft", context_id=approved["context_id"])
         self.assertEqual(repair["payload"]["works"], [replacement])
+        self.assertEqual(repair["manual_works"], [])
         self.assertEqual([s["page"] for s in repair["payload"]["sources"]], [125])
         self.ask("S-0024", "Не подтвердили, что подшипник муфты выключения сцепления неисправен.",
                  context_id=approved["context_id"])
         with self.assertRaises(HTTPError):
             self.post("orders/draft", context_id=approved["context_id"])
+        self.sender.assert_not_called()
+
+    def test_s0024_manual_bearing_replacement_keeps_diagnostic_sources(self):
+        self.diagnose("S-0024")
+        self.ask("S-0024", "Шум усиливается при нажатии педали.")
+        reply = self.ask("S-0024", "Установлено ЯМЗ-181-10")
+        draft = self.post("orders/draft", context_id=reply["context_id"])
+        self.assertEqual({source["page"] for source in draft["payload"]["sources"]}, {120, 121})
+
+        replacement = "Заменить муфту выключения сцепления с подшипником"
+        version = {key: draft[key] for key in ("context_id", "draft_id", "revision")}
+        edited = self.post("orders/update", **version, changes={"works": [replacement]})
+        self.assertGreater(edited["revision"], draft["revision"])
+        self.assertEqual(edited["payload"]["works"], [replacement])
+        self.assertEqual(edited["manual_works"], [replacement])
+        self.assertEqual(edited["payload"]["diagnosis"], draft["payload"]["diagnosis"])
+        self.assertEqual(edited["payload"]["sources"], draft["payload"]["sources"])
+        self.assertEqual(self.post("orders/draft", context_id=reply["context_id"]), edited)
         self.sender.assert_not_called()
 
     def test_s0024_uses_gearbox_checks_after_localizing_noise_there(self):

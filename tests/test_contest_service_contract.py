@@ -147,9 +147,11 @@ class WorkOrderTests(unittest.TestCase):
             store.send(cid, draft_id, draft["revision"], confirmed=False)
         parts = store.update(cid, draft_id, draft["revision"], {"parts": ["Прокладка"]})
         verify.assert_not_called()
-        changed = store.update(cid, draft_id, parts["revision"], {"works": ["Проверить масляный фильтр"]})
-        verify.assert_called_once_with("M333YK47", "S-0005", ["Проверить масляный фильтр"], [SOURCE])
+        edited_text = "проверить датчик."
+        changed = store.update(cid, draft_id, parts["revision"], {"works": [edited_text]})
+        verify.assert_called_once_with("M333YK47", "S-0005", [edited_text], [SOURCE])
         self.assertEqual(changed["payload"]["sources"], [new_source])
+        self.assertEqual(changed["manual_works"], [])
         with self.assertRaises(DraftChanged):
             store.send(cid, draft_id, parts["revision"], confirmed=True)
         sender.assert_not_called()
@@ -163,13 +165,44 @@ class WorkOrderTests(unittest.TestCase):
         self.assertEqual(new_draft["status"], "draft")
         self.assertEqual(new_draft["payload"], sent["payload"])
 
-    def test_rejected_work_edit_preserves_draft(self):
-        store = self.start(Mock(), Mock(side_effect=ValueError("Источник не найден")))
+    def test_manual_work_is_saved_with_original_diagnostic_sources(self):
+        sender = Mock(return_value="TKT-0001")
+        new_source = dict(SOURCE, page=27)
+        verify = Mock(return_value=[new_source])
+        store = self.start(sender, verify)
         cid = store.open_context("M333YK47", "S-0005", DIAGNOSIS, REPLY)
         initial = store.draft(cid)
-        with self.assertRaisesRegex(ValueError, "Источник не найден"):
-            store.update(cid, initial["draft_id"], initial["revision"], {"works": ["Другая работа"]})
-        self.assertEqual(store.draft(cid), initial)
+        known = "проверить датчик."
+        rechecked = store.update(cid, initial["draft_id"], initial["revision"], {"works": [known]})
+        self.assertEqual(rechecked["payload"]["sources"], [new_source])
+        verify.reset_mock()
+
+        manual = "Выполнить дефектовку стука."
+        works = [known, manual]
+        changed = store.update(cid, initial["draft_id"], rechecked["revision"], {"works": works})
+        verify.assert_not_called()
+        self.assertGreater(changed["revision"], rechecked["revision"])
+        self.assertEqual(changed["payload"]["works"], works)
+        self.assertEqual(changed["manual_works"], [manual])
+        self.assertEqual(changed["payload"]["sources"], initial["payload"]["sources"])
+        self.assertEqual(store.draft(cid), changed)
+        sender.assert_not_called()
+        sent = store.send(cid, initial["draft_id"], changed["revision"], confirmed=True)
+        self.assertEqual(sent["number"], "TKT-0001")
+        self.assertEqual(sender.call_args.args[0]["works"], works)
+        self.assertEqual(store.history("M333YK47")[0]["manual_works"], [manual])
+
+    def test_missing_verification_accepts_previously_proposed_work(self):
+        verify = Mock(side_effect=ValueError("Источник не найден"))
+        store = self.start(Mock(), verify)
+        cid = store.open_context("M333YK47", "S-0005", DIAGNOSIS, REPLY)
+        initial = store.draft(cid)
+        edited_text = "проверить датчик."
+        changed = store.update(cid, initial["draft_id"], initial["revision"], {"works": [edited_text]})
+        self.assertGreater(changed["revision"], initial["revision"])
+        self.assertEqual(changed["payload"]["works"], [edited_text])
+        self.assertEqual(changed["manual_works"], [])
+        self.assertEqual(changed["payload"]["sources"], initial["payload"]["sources"])
 
     def test_uncertain_submission_is_recorded_and_cannot_be_retried(self):
         sender = Mock(side_effect=TimeoutError("ТОиР недоступна"))

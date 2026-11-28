@@ -31,6 +31,7 @@ class ReferenceAnswerTests(unittest.TestCase):
     def setUp(self):
         root = self.enterContext(TemporaryDirectory())
         self.model = Mock()
+        self.model.analyze_turn.return_value = None
         self.enterContext(patch.object(web, "ManualSession", ReferenceSession))
         self.url = self.enterContext(running(web.make_server(
             ("127.0.0.1", 0), root=root, search=object(), answer_model=self.model,

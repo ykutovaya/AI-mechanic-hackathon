@@ -2,7 +2,7 @@
 
 const el = id => document.getElementById(id);
 const machine = el("machine"), check = el("check"), log = el("log");
-let machines = [], topic = "", activeCheck = null, pending = null;
+let machines = [], topic = "", dialogueId = "", activeCheck = null, pending = null;
 
 function node(tag, text, css) {
   const item = document.createElement(tag);
@@ -46,7 +46,7 @@ function reset() {
   orderDesk.refreshHistory();
   if (pending) pending.abort();
   pending = null;
-  topic = ""; activeCheck = null;
+  topic = ""; dialogueId = ""; activeCheck = null;
   log.replaceChildren(empty);
   el("question").value = "";
   feedback();
@@ -246,8 +246,10 @@ async function requestAnswer(isDiagnostic) {
     if (previous) payload.previous_context_id = previous;
     activeCheck = null;
     topic = "";
+    dialogueId = "";
   } else {
     Object.assign(payload, {question, topic});
+    if (dialogueId) payload.dialogue_id = dialogueId;
     if (orderDesk.current()) payload.context_id = orderDesk.current();
   }
   const controller = new AbortController();
@@ -274,6 +276,7 @@ async function requestAnswer(isDiagnostic) {
       }
     }
     topic = reply.topic || "";
+    dialogueId = reply.dialogue_id || "";
     render(reply, isDiagnostic);
     if (reply.order_context_changed) {
       orderDesk.clear(false);

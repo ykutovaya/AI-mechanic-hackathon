@@ -81,12 +81,15 @@ const orderDesk = (() => {
           node("p", "Приоритет — " + priorities[p.priority] + ". " + row.priority_reason));
         for (const [title, list] of [["Работы", p.works], ["Запчасти", p.parts]]) {
           const group = node("ul");
-          for (const value of list) group.append(node("li", value));
+          for (const value of list) {
+            const manual = list === p.works && row.manual_works?.includes(value);
+            group.append(node("li", manual ? value + " · запись механика" : value));
+          }
           details.append(node("strong", title));
           details.append(list.length ? group : node("p", "Не указаны"));
         }
         const refs = node("div", "", "refs");
-        refs.append(node("strong", "Источники работ"));
+        refs.append(node("strong", "Источники диагностики и рекомендаций"));
         p.sources.forEach(s => refs.append(sourceLink(s, result.manuals)));
         details.append(refs);
         pane.append(details);
@@ -138,8 +141,11 @@ const orderDesk = (() => {
     el("order-lamp").checked = row.lamp_at_speed;
     el("order-reason").textContent = row.priority_reason;
     const refs = el("order-sources");
-    refs.replaceChildren(node("strong", "Источники работ"));
+    refs.replaceChildren(node("strong", "Источники диагностики и рекомендаций"));
     p.sources.forEach(s => refs.append(sourceLink(s)));
+    if (row.manual_works?.length) {
+      refs.append(node("p", "Записи механика — " + row.manual_works.join(" · ")));
+    }
     notice(row.status === "draft" ? "" : receiptText(row), row.status === "uncertain");
     controls();
   }
@@ -214,7 +220,7 @@ const orderDesk = (() => {
     if (!draft || busy || draft.status !== "draft") return;
     const owner = context, changes = edits(), lamp = el("order-lamp").checked;
     if (!draft.payload.sources.length) {
-      notice("Для отправки нужен источник для работ.", true);
+      notice("Для отправки нужна ссылка на руководство по этой диагностике.", true);
       return;
     }
     if (!changes.diagnosis || !changes.works.length) {

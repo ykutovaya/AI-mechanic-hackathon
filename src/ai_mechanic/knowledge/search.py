@@ -1491,7 +1491,7 @@ def _zmz_5234_valve_clearance(search):
         work="Проверить тепловые зазоры клапанов щупом на холодном двигателе.")
 
 
-def retrieve(backend, engine, question, diagnosis=None, topic="", *, variant=None, procedures=()):
+def retrieve(backend, engine, question, diagnosis=None, topic="", *, variant=None, procedures=(), search_hint=""):
     """Разбирает вопрос на поисковые фразы. Модель берётся из карточки машины."""
     q = re.sub(rf"(?<!\w){re.escape(engine)}(?!\w)", "", question, flags=re.I).casefold()
     fault = " ".join(str((diagnosis or {}).get(k) or "") for k in ("anomaly_title", "description")).casefold()
@@ -1809,6 +1809,8 @@ def retrieve(backend, engine, question, diagnosis=None, topic="", *, variant=Non
                 topic = "component-reference"
                 clarification = reference
                 needs_clarification = bool(reference)
+        if search_hint and not (search.evidence or missing or needs_clarification or asks_about_fault):
+            _generic(search, search_hint, engine)
     if not search.evidence and topic in {"oil", "oil-low", "oil-valve"} and not missing:
         _generic(search, question, engine)
     if not search.evidence and topic in {"oil", "oil-low", "oil-valve"} and not missing:
