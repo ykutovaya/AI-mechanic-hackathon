@@ -41,6 +41,7 @@ from .knowledge.search import SearchUnavailable, add_search_arguments, configure
 from .ml_client import MLUnavailable, fetch_diagnosis
 from .work_order_service import OrderServiceError, submit_order
 from .work_orders import DraftChanged, WorkOrders
+from .yandex_gpt import YandexGPT, order_reference_answer
 
 
 STATIC = Path(__file__).with_name("static")
@@ -138,10 +139,11 @@ def _work_text(text):
 class Workshop:
     """Связывает выбранную проверку, поиск по руководству и черновик заявки."""
 
-    def __init__(self, root, data_dir, search, ml_url, toir_url, orders_db):
+    def __init__(self, root, data_dir, search, ml_url, toir_url, orders_db, answer_model=None):
         root = Path(root).resolve()
         self.session = partial(ManualSession, root=root, data_dir=data_dir, search=search)
         self.fetch = partial(fetch_diagnosis, ml_url)
+        self.answer_model = answer_model
         settings = self.session()
         self.machines = {m["machine_id"]: m for m in settings.machines}
         self.diagnostics = {}
@@ -316,6 +318,8 @@ class Workshop:
             if data.get("context_id"):
                 cid = _field(data, "context_id")
                 reply["order_context_changed"] = not self.orders.refresh(cid, *selection, diagnostic)
+        if not requested and diagnostic is None and self.answer_model is not None:
+            order_reference_answer(reply, question, session.topic, self.answer_model)
         reply.pop("inspection_steps", None)
         return reply
 
@@ -512,13 +516,13 @@ class WebHandler(BaseHTTPRequestHandler):
 
 def make_server(address, *, root=None, data_dir="data", search=None,
                 qdrant_url=None, collection=None, search_mode="hybrid",
-                ml_url=None, toir_url=None, orders_db="data/state/work_orders.sqlite"):
+                ml_url=None, toir_url=None, orders_db="data/state/work_orders.sqlite", answer_model=None):
     """Создаёт HTTP-сервер с данными из указанного проекта."""
     if search is None:
         search = configured_search(qdrant_url, collection, search_mode)
     ml_url = ml_url or os.getenv("MOCK_ML_URL") or "http://127.0.0.1:8001"
     toir_url = toir_url or os.getenv("MOCK_TOIR_URL") or "http://127.0.0.1:8002"
-    workshop = Workshop(root or Path.cwd(), data_dir, search, ml_url, toir_url, orders_db)
+    workshop = Workshop(root or Path.cwd(), data_dir, search, ml_url, toir_url, orders_db, answer_model)
     server = ThreadingHTTPServer(address, WebHandler)
     server.workshop = workshop
     return server
@@ -538,7 +542,7 @@ def main(argv=None):
         with make_server((args.host, args.port), data_dir=args.data, qdrant_url=args.qdrant_url,
                          collection=args.collection, search_mode=args.search_mode,
                          ml_url=args.ml_url,
-                         toir_url=args.toir_url, orders_db=args.orders_db) as server:
+                         toir_url=args.toir_url, orders_db=args.orders_db, answer_model=YandexGPT.from_env()) as server:
             print(f"Веб-чат: http://{args.host}:{server.server_port}", flush=True)
             server.serve_forever()
     except KeyboardInterrupt:
